@@ -6,6 +6,7 @@ Async OpenViking client implementation (embedded mode only).
 For HTTP mode, use AsyncHTTPClient or SyncHTTPClient.
 """
 
+from __future__ import annotations
 import threading
 from typing import Any, Dict, List, Optional, Union
 
@@ -58,11 +59,13 @@ class AsyncOpenViking:
 
         self.user = UserIdentifier.the_default_user()
         self._initialized = False
-        self._singleton_initialized = True
+        # Mark initialized only after LocalClient is successfully constructed.
+        self._singleton_initialized = False
 
         self._client: BaseClient = LocalClient(
             path=path,
         )
+        self._singleton_initialized = True
 
     # ============= Lifecycle methods =============
 
@@ -78,7 +81,9 @@ class AsyncOpenViking:
 
     async def close(self) -> None:
         """Close OpenViking and release resources."""
-        await self._client.close()
+        client = getattr(self, "_client", None)
+        if client is not None:
+            await client.close()
         self._initialized = False
         self._singleton_initialized = False
 
@@ -88,20 +93,33 @@ class AsyncOpenViking:
         with cls._lock:
             if cls._instance is not None:
                 await cls._instance.close()
-                cls._instance._initialized = False
-                cls._instance._singleton_initialized = False
                 cls._instance = None
 
     # ============= Session methods =============
 
-    def session(self, session_id: Optional[str] = None) -> Session:
+    def session(self, session_id: Optional[str] = None, must_exist: bool = False) -> Session:
         """
         Create a new session or load an existing one.
 
         Args:
             session_id: Session ID, creates a new session (auto-generated ID) if None
+            must_exist: If True and session_id is provided, raises NotFoundError
+                        when the session does not exist.
+                        If session_id is None, must_exist is ignored.
         """
-        return self._client.session(session_id)
+        return self._client.session(session_id, must_exist=must_exist)
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Check whether a session exists in storage.
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if the session exists, False otherwise
+        """
+        await self._ensure_initialized()
+        return await self._client.session_exists(session_id)
 
     async def create_session(self) -> Dict[str, Any]:
         """Create a new session."""
@@ -123,10 +141,27 @@ class AsyncOpenViking:
         await self._ensure_initialized()
         await self._client.delete_session(session_id)
 
-    async def add_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Add a message to a session."""
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str | None = None,
+        parts: list[dict] | None = None,
+    ) -> Dict[str, Any]:
+        """Add a message to a session.
+
+        Args:
+            session_id: Session ID
+            role: Message role ("user" or "assistant")
+            content: Text content (simple mode)
+            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+
+        If both content and parts are provided, parts takes precedence.
+        """
         await self._ensure_initialized()
-        return await self._client.add_message(session_id=session_id, role=role, content=content)
+        return await self._client.add_message(
+            session_id=session_id, role=role, content=content, parts=parts
+        )
 
     async def commit_session(self, session_id: str) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
@@ -143,17 +178,24 @@ class AsyncOpenViking:
         instruction: str = "",
         wait: bool = False,
         timeout: float = None,
+        build_index: bool = True,
+        summarize: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Add resource to OpenViking (only supports resources scope).
+        """
+        Add a resource (file/URL) to OpenViking.
 
         Args:
-            wait: Whether to wait for semantic extraction and vectorization to complete
-            timeout: Wait timeout in seconds
-            **kwargs: Extra options forwarded to the parser chain, e.g.
-                ``strict``, ``ignore_dirs``, ``include``, ``exclude``.
+            path: Local file path or URL.
+            reason: Context/reason for adding this resource.
+            instruction: Specific instruction for processing.
+            wait: If True, wait for processing to complete.
+            target: Target path in VikingFS (e.g., "kb/docs").
+            build_index: Whether to build vector index immediately (default: True).
+            summarize: Whether to generate summary (default: False).
         """
         await self._ensure_initialized()
+
         return await self._client.add_resource(
             path=path,
             target=target,
@@ -161,6 +203,8 @@ class AsyncOpenViking:
             instruction=instruction,
             wait=wait,
             timeout=timeout,
+            build_index=build_index,
+            summarize=summarize,
             **kwargs,
         )
 
@@ -168,6 +212,26 @@ class AsyncOpenViking:
         """Wait for all queued processing to complete."""
         await self._ensure_initialized()
         return await self._client.wait_processed(timeout=timeout)
+
+    async def build_index(self, resource_uris: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
+        """
+        Manually trigger index building for resources.
+
+        Args:
+            resource_uris: Single URI or list of URIs to index.
+        """
+        await self._ensure_initialized()
+        return await self._client.build_index(resource_uris, **kwargs)
+
+    async def summarize(self, resource_uris: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
+        """
+        Manually trigger summarization for resources.
+
+        Args:
+            resource_uris: Single URI or list of URIs to summarize.
+        """
+        await self._ensure_initialized()
+        return await self._client.summarize(resource_uris, **kwargs)
 
     async def add_skill(
         self,
@@ -255,10 +319,10 @@ class AsyncOpenViking:
         await self._ensure_initialized()
         return await self._client.overview(uri)
 
-    async def read(self, uri: str) -> str:
+    async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         """Read file content"""
         await self._ensure_initialized()
-        return await self._client.read(uri)
+        return await self._client.read(uri, offset=offset, limit=limit)
 
     async def ls(self, uri: str, **kwargs) -> List[Any]:
         """

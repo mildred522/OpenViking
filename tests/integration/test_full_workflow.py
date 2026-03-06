@@ -67,15 +67,11 @@ class TestResourceToSearchWorkflow:
 
         # 3. Read searched resource
         if search_result.resources:
-            if search_result.resources[0].is_leaf:
-                content = await client.read(search_result.resources[0].uri)
-                assert len(content) > 0
-            else:
-                res = await client.tree(search_result.resources[0].uri)
-                for data in res:
-                    if not data["isDir"]:
-                        content = await client.read(data["uri"])
-                        assert len(content) > 0
+            res = await client.tree(search_result.resources[0].uri)
+            for data in res:
+                if not data["isDir"]:
+                    content = await client.read(data["uri"])
+                    assert len(content) > 0
 
 
 class TestSessionWorkflow:
@@ -128,7 +124,7 @@ class TestSessionWorkflow:
 
         # 2. Reload session
         session2 = client.session(session_id=session_id)
-        session2.load()
+        await session2.load()
 
         # 3. Continue conversation
         session2.add_message("user", [TextPart("Second message")])

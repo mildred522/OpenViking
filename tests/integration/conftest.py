@@ -22,8 +22,8 @@ from openviking.server.config import ServerConfig
 from openviking.service.core import OpenVikingService
 from openviking_cli.session.user_id import UserIdentifier
 
-TEST_ROOT = Path(__file__).parent
-TEST_TMP_DIR = TEST_ROOT / ".tmp_integration"
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+TEST_TMP_DIR = PROJECT_ROOT / "test_data" / "tmp_integration"
 
 
 @pytest.fixture(scope="session")
@@ -32,7 +32,6 @@ def temp_dir():
     shutil.rmtree(TEST_TMP_DIR, ignore_errors=True)
     TEST_TMP_DIR.mkdir(parents=True, exist_ok=True)
     yield TEST_TMP_DIR
-    shutil.rmtree(TEST_TMP_DIR, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -51,7 +50,7 @@ def server_url(temp_dir):
     )
     loop.run_until_complete(svc.initialize())
 
-    config = ServerConfig(api_key=None)
+    config = ServerConfig()
     fastapi_app = create_app(config=config, service=svc)
 
     # Find a free port

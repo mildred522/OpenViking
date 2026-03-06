@@ -41,6 +41,11 @@ class S3Config(BaseModel):
         description="Enable/Disable SSL (HTTPS) for S3 connections. Set to False for local testing without HTTPS.",
     )
 
+    use_path_style: bool = Field(
+        default=True,
+        description="true represent UsePathStyle for MinIO and some S3-compatible services; false represent VirtualHostStyle for TOS  and some S3-compatible services.",
+    )
+
     model_config = {"extra": "forbid"}
 
     def validate_config(self):
@@ -66,7 +71,10 @@ class S3Config(BaseModel):
 class AGFSConfig(BaseModel):
     """Configuration for AGFS (Agent Global File System)."""
 
-    path: str = Field(default="./data", description="AGFS data storage path")
+    path: Optional[str] = Field(
+        default=None,
+        description="[Deprecated in favor of `storage.workspace`] AGFS data storage path. This will be ignored if `storage.workspace` is set.",
+    )
 
     port: int = Field(default=1833, description="AGFS service port")
 
@@ -74,6 +82,11 @@ class AGFSConfig(BaseModel):
 
     url: Optional[str] = Field(
         default="http://localhost:1833", description="AGFS service URL for service mode"
+    )
+
+    mode: str = Field(
+        default="binding-client",
+        description="AGFS client mode: 'http-client' | 'binding-client'",
     )
 
     backend: str = Field(
@@ -89,6 +102,12 @@ class AGFSConfig(BaseModel):
         description="Enable/Disable SSL (HTTPS) for AGFS service. Set to False for local testing without HTTPS.",
     )
 
+    lib_path: Optional[str] = Field(
+        default=None,
+        description="Path to AGFS binding shared library. If set, use python binding instead of HTTP client. "
+        "Default: third_party/agfs/bin/libagfsbinding.{so,dylib}",
+    )
+
     # S3 backend configuration
     # These settings are used when backend is set to 's3'.
     # AGFS will act as a gateway to the specified S3 bucket.
@@ -99,14 +118,18 @@ class AGFSConfig(BaseModel):
     @model_validator(mode="after")
     def validate_config(self):
         """Validate configuration completeness and consistency"""
+        if self.mode not in ["http-client", "binding-client"]:
+            raise ValueError(
+                f"Invalid AGFS mode: '{self.mode}'. Must be one of: 'http-client', 'binding-client'"
+            )
+
         if self.backend not in ["local", "s3", "memory"]:
             raise ValueError(
                 f"Invalid AGFS backend: '{self.backend}'. Must be one of: 'local', 's3', 'memory'"
             )
 
         if self.backend == "local":
-            if not self.path:
-                raise ValueError("AGFS local backend requires 'path' to be set")
+            pass
 
         elif self.backend == "s3":
             # Validate S3 configuration

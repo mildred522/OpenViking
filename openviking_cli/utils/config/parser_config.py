@@ -135,7 +135,7 @@ class PDFConfig(ParserConfig):
         mineru_endpoint: MinerU API endpoint URL
         mineru_api_key: MinerU API authentication key
         mineru_timeout: MinerU request timeout in seconds
-        mineruparams: Additional MinerU API parameters
+        mineru_params: Additional MinerU API parameters
     """
 
     strategy: str = "auto"  # "local" | "mineru" | "auto"
@@ -145,6 +145,11 @@ class PDFConfig(ParserConfig):
     mineru_api_key: Optional[str] = None  # API authentication key
     mineru_timeout: float = 300.0  # Request timeout in seconds (5 minutes)
     mineru_params: Optional[dict] = None  # Additional API parameters
+
+    # Heading detection configuration
+    heading_detection: str = "auto"  # "bookmarks" | "font" | "auto" | "none"
+    font_heading_min_delta: float = 1.5  # Minimum font size delta from body text (pt)
+    max_heading_levels: int = 4  # Maximum heading levels for font analysis
 
     def validate(self) -> None:
         """
@@ -169,14 +174,46 @@ class PDFConfig(ParserConfig):
         if self.mineru_timeout <= 0:
             raise ValueError("mineru_timeout must be positive")
 
+        if self.heading_detection not in ("bookmarks", "font", "auto", "none"):
+            raise ValueError(f"Invalid heading_detection: {self.heading_detection}")
+
+        if self.font_heading_min_delta <= 0:
+            raise ValueError("font_heading_min_delta must be positive")
+
 
 @dataclass
-class CodeConfig(ParserConfig):
+class CodeHostingConfig(ParserConfig):
+    """
+    Base configuration for code hosting platform domains.
+
+    Attributes:
+        code_hosting_domains: List of code hosting platform domains (github.com, gitlab.com, etc.)
+        github_domains: List of GitHub domains (github.com, www.github.com)
+        gitlab_domains: List of GitLab domains (gitlab.com, www.gitlab.com)
+    """
+
+    # Code hosting platform configuration
+    code_hosting_domains: list = None
+    github_domains: list = None
+    gitlab_domains: list = None
+
+    def __post_init__(self):
+        """Initialize default values for mutable fields."""
+        if self.code_hosting_domains is None:
+            self.code_hosting_domains = ["github.com", "gitlab.com"]
+        if self.github_domains is None:
+            self.github_domains = ["github.com", "www.github.com"]
+        if self.gitlab_domains is None:
+            self.gitlab_domains = ["gitlab.com", "www.gitlab.com"]
+
+
+@dataclass
+class CodeConfig(CodeHostingConfig):
     """
     Configuration for code parsing.
 
     Attributes:
-        enable_ast: Whether to use AST parsing (for supported languages)
+        code_summary_mode: Summary generation mode ("llm" | "ast" | "ast_llm")
         extract_functions: Whether to extract function definitions
         extract_classes: Whether to extract class definitions
         extract_imports: Whether to extract import statements
@@ -186,9 +223,10 @@ class CodeConfig(ParserConfig):
         max_token_limit: Maximum tokens to process per file
         truncation_strategy: "head", "tail", or "balanced"
         warn_on_truncation: Whether to warn when truncation occurs
+        github_raw_domain: Domain for GitHub raw content (raw.githubusercontent.com)
     """
 
-    enable_ast: bool = True
+    code_summary_mode: str = "ast"  # "llm" | "ast" | "ast_llm"
     extract_functions: bool = True
     extract_classes: bool = True
     extract_imports: bool = True
@@ -198,6 +236,7 @@ class CodeConfig(ParserConfig):
     max_token_limit: int = 50000  # Maximum tokens to process per file
     truncation_strategy: str = "head"  # "head", "tail", or "balanced"
     warn_on_truncation: bool = True
+    github_raw_domain: str = "raw.githubusercontent.com"
 
     def validate(self) -> None:
         """
@@ -210,6 +249,12 @@ class CodeConfig(ParserConfig):
         super().validate()
 
         # Validate code-specific fields
+        if self.code_summary_mode not in ("llm", "ast", "ast_llm"):
+            raise ValueError(
+                f"Invalid code_summary_mode '{self.code_summary_mode}'. "
+                "Must be 'llm', 'ast', or 'ast_llm'"
+            )
+
         if self.max_line_length <= 0:
             raise ValueError("max_line_length must be positive")
 
@@ -229,7 +274,7 @@ class ImageConfig(ParserConfig):
     Configuration for image parsing.
 
     Attributes:
-        enable_ocr: Whether to perform OCR text extraction
+        enable_ocr: Whether to perform OCR text extraction, not implemented
         enable_vlm: Whether to use VLM for visual understanding
         ocr_lang: Language for OCR (e.g., "chi_sim", "eng")
         vlm_model: VLM model to use (e.g., "gpt-4-vision")
@@ -359,7 +404,7 @@ class MarkdownConfig(ParserConfig):
 
 
 @dataclass
-class HTMLConfig(ParserConfig):
+class HTMLConfig(CodeHostingConfig):
     """
     Configuration for HTML parsing.
 

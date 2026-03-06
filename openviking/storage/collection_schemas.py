@@ -7,13 +7,16 @@ Provides centralized schema definitions and factory functions for creating colle
 similar to how init_viking_fs encapsulates VikingFS initialization.
 """
 
+import asyncio
+import hashlib
 import json
 from typing import Any, Dict, Optional
 
 from openviking.models.embedder.base import EmbedResult
+from openviking.storage.errors import CollectionNotFoundError
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
-from openviking.storage.vikingdb_interface import CollectionNotFoundError, VikingDBInterface
+from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
@@ -43,7 +46,15 @@ class CollectionSchemas:
             "Fields": [
                 {"FieldName": "id", "FieldType": "string", "IsPrimaryKey": True},
                 {"FieldName": "uri", "FieldType": "path"},
+                # type 字段：当前版本未使用，保留用于未来扩展
+                # 预留用于表示资源的具体类型，如 "file", "directory", "image", "video", "repository" 等
                 {"FieldName": "type", "FieldType": "string"},
+                # context_type 字段：区分上下文的大类
+                # 枚举值："resource"（资源，默认）, "memory"（记忆）, "skill"（技能）
+                # 推导规则：
+                #   - URI 以 viking://agent/skills 开头 → "skill"
+                #   - URI 包含 "memories" → "memory"
+                #   - 其他情况 → "resource"
                 {"FieldName": "context_type", "FieldType": "string"},
                 {"FieldName": "vector", "FieldType": "vector", "Dim": vector_dim},
                 {"FieldName": "sparse_vector", "FieldType": "sparse_vector"},
@@ -51,11 +62,22 @@ class CollectionSchemas:
                 {"FieldName": "updated_at", "FieldType": "date_time"},
                 {"FieldName": "active_count", "FieldType": "int64"},
                 {"FieldName": "parent_uri", "FieldType": "path"},
-                {"FieldName": "is_leaf", "FieldType": "bool"},
+                # level 字段：区分 L0/L1/L2 层级
+                # 枚举值：
+                #   - 0 = L0（abstract，摘要）
+                #   - 1 = L1（overview，概览）
+                #   - 2 = L2（detail/content，详情/内容，默认）
+                # URI 命名规则：
+                #   - level=0: {目录}/.abstract.md
+                #   - level=1: {目录}/.overview.md
+                #   - level=2: {文件路径}
+                {"FieldName": "level", "FieldType": "int64"},
                 {"FieldName": "name", "FieldType": "string"},
                 {"FieldName": "description", "FieldType": "string"},
                 {"FieldName": "tags", "FieldType": "string"},
                 {"FieldName": "abstract", "FieldType": "string"},
+                {"FieldName": "account_id", "FieldType": "string"},
+                {"FieldName": "owner_space", "FieldType": "string"},
             ],
             "ScalarIndex": [
                 "uri",
@@ -65,9 +87,11 @@ class CollectionSchemas:
                 "updated_at",
                 "active_count",
                 "parent_uri",
-                "is_leaf",
+                "level",
                 "name",
                 "tags",
+                "account_id",
+                "owner_space",
             ],
         }
 
@@ -103,11 +127,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
     Supports both dense and sparse embeddings based on configuration.
     """
 
-    def __init__(self, vikingdb: VikingDBInterface):
+    def __init__(self, vikingdb: VikingVectorIndexBackend):
         """Initialize the text embedding handler.
 
         Args:
-            vikingdb: VikingDBInterface instance for writing to vector database
+            vikingdb: VikingVectorIndexBackend instance for writing to vector database
         """
         from openviking_cli.utils.config import get_openviking_config
 
@@ -122,6 +146,20 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         """Initialize the embedder instance from config."""
         self._embedder = config.embedding.get_embedder()
 
+    @staticmethod
+    def _seed_uri_for_id(uri: str, level: Any) -> str:
+        """Build deterministic id seed URI from canonical uri + hierarchy level."""
+        try:
+            level_int = int(level)
+        except (TypeError, ValueError):
+            level_int = 2
+
+        if level_int == 0:
+            return uri if uri.endswith("/.abstract.md") else f"{uri}/.abstract.md"
+        if level_int == 1:
+            return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
+        return uri
+
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Process dequeued message and add embedding vector(s)."""
         if not data:
@@ -132,6 +170,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             # Parse EmbeddingMsg from data
             embedding_msg = EmbeddingMsg.from_dict(queue_data)
             inserted_data = embedding_msg.context_data
+
+            if self._vikingdb.is_closing:
+                logger.debug("Skip embedding dequeue during shutdown")
+                self.report_success()
+                return None
 
             # Only process string messages
             if not isinstance(embedding_msg.message, str):
@@ -148,7 +191,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
             # Generate embedding vector(s)
             if self._embedder:
-                result: EmbedResult = self._embedder.embed(embedding_msg.message)
+                # embed() is a blocking HTTP call; offload to thread pool to avoid
+                # blocking the event loop and allow real concurrency.
+                result: EmbedResult = await asyncio.to_thread(
+                    self._embedder.embed, embedding_msg.message
+                )
 
                 # Add dense vector
                 if result.dense_vector:
@@ -172,14 +219,22 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
             # Write to vector database
             try:
-                record_id = await self._vikingdb.insert(self._collection_name, inserted_data)
+                # Ensure vector DB has deterministic IDs per semantic layer.
+                uri = inserted_data.get("uri")
+                if uri:
+                    account_id = inserted_data.get("account_id", "default")
+                    seed_uri = self._seed_uri_for_id(uri, inserted_data.get("level", 2))
+                    id_seed = f"{account_id}:{seed_uri}"
+                    inserted_data["id"] = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
+
+                record_id = await self._vikingdb.upsert(inserted_data)
                 if record_id:
                     logger.debug(
                         f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"
                     )
             except CollectionNotFoundError as db_err:
                 # During shutdown, queue workers may finish one dequeued item.
-                if getattr(self._vikingdb, "is_closing", False):
+                if self._vikingdb.is_closing:
                     logger.debug(f"Skip embedding write during shutdown: {db_err}")
                     self.report_success()
                     return None
@@ -187,6 +242,10 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 self.report_error(str(db_err), data)
                 return None
             except Exception as db_err:
+                if self._vikingdb.is_closing:
+                    logger.debug(f"Skip embedding write during shutdown: {db_err}")
+                    self.report_success()
+                    return None
                 logger.error(f"Failed to write to vector database: {db_err}")
                 import traceback
 

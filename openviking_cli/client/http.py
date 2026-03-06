@@ -5,6 +5,10 @@
 Implements BaseClient interface using HTTP calls to OpenViking Server.
 """
 
+import tempfile
+import uuid
+import zipfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
@@ -31,11 +35,14 @@ from openviking_cli.retrieve.types import FindResult
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import run_async
 from openviking_cli.utils.config.config_loader import (
-    DEFAULT_OVCLI_CONF,
-    OPENVIKING_CLI_CONFIG_ENV,
     load_json_config,
     resolve_config_path,
 )
+from openviking_cli.utils.config.consts import (
+    DEFAULT_OVCLI_CONF,
+    OPENVIKING_CLI_CONFIG_ENV,
+)
+from openviking_cli.utils.uri import VikingURI
 
 # Error code to exception class mapping
 ERROR_CODE_TO_EXCEPTION = {
@@ -126,19 +133,29 @@ class AsyncHTTPClient(BaseClient):
         self,
         url: Optional[str] = None,
         api_key: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        timeout: float = 60.0,
     ):
         """Initialize AsyncHTTPClient.
 
         Args:
             url: OpenViking Server URL. If not provided, reads from ovcli.conf.
             api_key: API key for authentication. If not provided, reads from ovcli.conf.
+            agent_id: Agent identifier. If not provided, reads from ovcli.conf.
+            timeout: HTTP request timeout in seconds. Default 60.0.
         """
         if url is None:
+            # print(f"OPENVIKING_CLI_CONFIG_ENV={OPENVIKING_CLI_CONFIG_ENV}")
+            # print(f"DEFAULT_OVCLI_CONF={DEFAULT_OVCLI_CONF}")
             config_path = resolve_config_path(None, OPENVIKING_CLI_CONFIG_ENV, DEFAULT_OVCLI_CONF)
             if config_path:
                 cfg = load_json_config(config_path)
+
                 url = cfg.get("url")
                 api_key = api_key or cfg.get("api_key")
+                agent_id = agent_id or cfg.get("agent_id")
+                if timeout == 60.0:  # only override default with config value
+                    timeout = cfg.get("timeout", 60.0)
         if not url:
             raise ValueError(
                 "url is required. Pass it explicitly or configure in "
@@ -146,7 +163,9 @@ class AsyncHTTPClient(BaseClient):
             )
         self._url = url.rstrip("/")
         self._api_key = api_key
+        self._agent_id = agent_id
         self._user = UserIdentifier.the_default_user()
+        self._timeout = timeout
         self._http: Optional[httpx.AsyncClient] = None
         self._observer: Optional[_HTTPObserver] = None
 
@@ -157,17 +176,22 @@ class AsyncHTTPClient(BaseClient):
         headers = {}
         if self._api_key:
             headers["X-API-Key"] = self._api_key
+        if self._agent_id:
+            headers["X-OpenViking-Agent"] = self._agent_id
         self._http = httpx.AsyncClient(
             base_url=self._url,
             headers=headers,
-            timeout=60.0,
+            timeout=self._timeout,
         )
         self._observer = _HTTPObserver(self)
 
     async def close(self) -> None:
         """Close the HTTP client."""
         if self._http:
-            await self._http.aclose()
+            try:
+                await self._http.aclose()
+            except RuntimeError:
+                pass
             self._http = None
 
     # ============= Internal Helpers =============
@@ -218,6 +242,42 @@ class AsyncHTTPClient(BaseClient):
         else:
             raise exc_class(message)
 
+    def _is_local_server(self) -> bool:
+        """Check if the server URL is localhost or 127.0.0.1."""
+        from urllib.parse import urlparse
+
+        parsed_url = urlparse(self._url)
+        hostname = parsed_url.hostname
+        return hostname in ("localhost", "127.0.0.1")
+
+    def _zip_directory(self, dir_path: str) -> str:
+        """Create a temporary zip file from a directory."""
+        dir_path = Path(dir_path)
+        if not dir_path.is_dir():
+            raise ValueError(f"Path {dir_path} is not a directory")
+
+        temp_dir = tempfile.gettempdir()
+        zip_path = Path(temp_dir) / f"temp_upload_{uuid.uuid4().hex}.zip"
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in dir_path.rglob("*"):
+                if file_path.is_file():
+                    arcname = file_path.relative_to(dir_path)
+                    zipf.write(file_path, arcname=arcname)
+
+        return str(zip_path)
+
+    async def _upload_temp_file(self, file_path: str) -> str:
+        """Upload a file to /api/v1/resources/temp_upload and return the temp_path."""
+        with open(file_path, "rb") as f:
+            files = {"file": (Path(file_path).name, f, "application/octet-stream")}
+            response = await self._http.post(
+                "/api/v1/resources/temp_upload",
+                files=files,
+            )
+        result = self._handle_response(response)
+        return result.get("temp_path", "")
+
     # ============= Resource Management =============
 
     async def add_resource(
@@ -228,18 +288,46 @@ class AsyncHTTPClient(BaseClient):
         instruction: str = "",
         wait: bool = False,
         timeout: Optional[float] = None,
+        strict: bool = True,
+        ignore_dirs: Optional[str] = None,
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+        directly_upload_media: bool = True,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking."""
+        request_data = {
+            "target": target,
+            "reason": reason,
+            "instruction": instruction,
+            "wait": wait,
+            "timeout": timeout,
+            "strict": strict,
+            "ignore_dirs": ignore_dirs,
+            "include": include,
+            "exclude": exclude,
+            "directly_upload_media": directly_upload_media,
+        }
+
+        path_obj = Path(path)
+        if path_obj.exists() and not self._is_local_server():
+            if path_obj.is_dir():
+                zip_path = self._zip_directory(path)
+                try:
+                    temp_path = await self._upload_temp_file(zip_path)
+                    request_data["temp_path"] = temp_path
+                finally:
+                    Path(zip_path).unlink(missing_ok=True)
+            elif path_obj.is_file():
+                temp_path = await self._upload_temp_file(path)
+                request_data["temp_path"] = temp_path
+            else:
+                request_data["path"] = path
+        else:
+            request_data["path"] = path
+
         response = await self._http.post(
             "/api/v1/resources",
-            json={
-                "path": path,
-                "target": target,
-                "reason": reason,
-                "instruction": instruction,
-                "wait": wait,
-                "timeout": timeout,
-            },
+            json=request_data,
         )
         return self._handle_response(response)
 
@@ -250,21 +338,44 @@ class AsyncHTTPClient(BaseClient):
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking."""
+        request_data = {
+            "wait": wait,
+            "timeout": timeout,
+        }
+
+        if isinstance(data, str):
+            path_obj = Path(data)
+            if path_obj.exists() and not self._is_local_server():
+                if path_obj.is_dir():
+                    zip_path = self._zip_directory(data)
+                    try:
+                        temp_path = await self._upload_temp_file(zip_path)
+                        request_data["temp_path"] = temp_path
+                    finally:
+                        Path(zip_path).unlink(missing_ok=True)
+                elif path_obj.is_file():
+                    temp_path = await self._upload_temp_file(data)
+                    request_data["temp_path"] = temp_path
+                else:
+                    request_data["data"] = data
+            else:
+                request_data["data"] = data
+        else:
+            request_data["data"] = data
+
         response = await self._http.post(
             "/api/v1/skills",
-            json={
-                "data": data,
-                "wait": wait,
-                "timeout": timeout,
-            },
+            json=request_data,
         )
         return self._handle_response(response)
 
     async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Wait for all processing to complete."""
+        http_timeout = timeout if timeout else 600.0
         response = await self._http.post(
             "/api/v1/system/wait",
             json={"timeout": timeout},
+            timeout=http_timeout,
         )
         return self._handle_response(response)
 
@@ -281,6 +392,7 @@ class AsyncHTTPClient(BaseClient):
         node_limit: int = 1000,
     ) -> List[Any]:
         """List directory contents."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/fs/ls",
             params={
@@ -304,6 +416,7 @@ class AsyncHTTPClient(BaseClient):
         node_limit: int = 1000,
     ) -> List[Dict[str, Any]]:
         """Get directory tree."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/fs/tree",
             params={
@@ -318,6 +431,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         """Get resource status."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/fs/stat",
             params={"uri": uri},
@@ -326,6 +440,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def mkdir(self, uri: str) -> None:
         """Create directory."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.post(
             "/api/v1/fs/mkdir",
             json={"uri": uri},
@@ -334,6 +449,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def rm(self, uri: str, recursive: bool = False) -> None:
         """Remove resource."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.request(
             "DELETE",
             "/api/v1/fs",
@@ -343,6 +459,8 @@ class AsyncHTTPClient(BaseClient):
 
     async def mv(self, from_uri: str, to_uri: str) -> None:
         """Move resource."""
+        from_uri = VikingURI.normalize(from_uri)
+        to_uri = VikingURI.normalize(to_uri)
         response = await self._http.post(
             "/api/v1/fs/mv",
             json={"from_uri": from_uri, "to_uri": to_uri},
@@ -351,16 +469,24 @@ class AsyncHTTPClient(BaseClient):
 
     # ============= Content Reading =============
 
-    async def read(self, uri: str) -> str:
-        """Read file content."""
+    async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+        """Read file content.
+
+        Args:
+            uri: Viking URI
+            offset: Starting line number (0-indexed). Default 0.
+            limit: Number of lines to read. -1 means read to end. Default -1.
+        """
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/content/read",
-            params={"uri": uri},
+            params={"uri": uri, "offset": offset, "limit": limit},
         )
         return self._handle_response(response)
 
     async def abstract(self, uri: str) -> str:
         """Read L0 abstract."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/content/abstract",
             params={"uri": uri},
@@ -369,6 +495,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def overview(self, uri: str) -> str:
         """Read L1 overview."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/content/overview",
             params={"uri": uri},
@@ -382,16 +509,20 @@ class AsyncHTTPClient(BaseClient):
         query: str,
         target_uri: str = "",
         limit: int = 10,
+        node_limit: Optional[int] = None,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict[str, Any]] = None,
     ) -> FindResult:
         """Semantic search without session context."""
+        if target_uri:
+            target_uri = VikingURI.normalize(target_uri)
+        actual_limit = node_limit if node_limit is not None else limit
         response = await self._http.post(
             "/api/v1/search/find",
             json={
                 "query": query,
                 "target_uri": target_uri,
-                "limit": limit,
+                "limit": actual_limit,
                 "score_threshold": score_threshold,
                 "filter": filter,
             },
@@ -405,10 +536,14 @@ class AsyncHTTPClient(BaseClient):
         session: Optional[Any] = None,
         session_id: Optional[str] = None,
         limit: int = 10,
+        node_limit: Optional[int] = None,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict[str, Any]] = None,
     ) -> FindResult:
         """Semantic search with optional session context."""
+        if target_uri:
+            target_uri = VikingURI.normalize(target_uri)
+        actual_limit = node_limit if node_limit is not None else limit
         sid = session_id or (session.session_id if session else None)
         response = await self._http.post(
             "/api/v1/search/search",
@@ -416,27 +551,38 @@ class AsyncHTTPClient(BaseClient):
                 "query": query,
                 "target_uri": target_uri,
                 "session_id": sid,
-                "limit": limit,
+                "limit": actual_limit,
                 "score_threshold": score_threshold,
                 "filter": filter,
             },
         )
         return FindResult.from_dict(self._handle_response(response))
 
-    async def grep(self, uri: str, pattern: str, case_insensitive: bool = False) -> Dict[str, Any]:
+    async def grep(
+        self,
+        uri: str,
+        pattern: str,
+        case_insensitive: bool = False,
+        node_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Content search with pattern."""
+        uri = VikingURI.normalize(uri)
+        request_json = {
+            "uri": uri,
+            "pattern": pattern,
+            "case_insensitive": case_insensitive,
+        }
+        if node_limit is not None:
+            request_json["node_limit"] = node_limit
         response = await self._http.post(
             "/api/v1/search/grep",
-            json={
-                "uri": uri,
-                "pattern": pattern,
-                "case_insensitive": case_insensitive,
-            },
+            json=request_json,
         )
         return self._handle_response(response)
 
     async def glob(self, pattern: str, uri: str = "viking://") -> Dict[str, Any]:
         """File pattern matching."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.post(
             "/api/v1/search/glob",
             json={"pattern": pattern, "uri": uri},
@@ -447,6 +593,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def relations(self, uri: str) -> List[Any]:
         """Get relations for a resource."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.get(
             "/api/v1/relations",
             params={"uri": uri},
@@ -455,6 +602,11 @@ class AsyncHTTPClient(BaseClient):
 
     async def link(self, from_uri: str, to_uris: Union[str, List[str]], reason: str = "") -> None:
         """Create link between resources."""
+        from_uri = VikingURI.normalize(from_uri)
+        if isinstance(to_uris, str):
+            to_uris = VikingURI.normalize(to_uris)
+        else:
+            to_uris = [VikingURI.normalize(u) for u in to_uris]
         response = await self._http.post(
             "/api/v1/relations/link",
             json={"from_uri": from_uri, "to_uris": to_uris, "reason": reason},
@@ -463,6 +615,8 @@ class AsyncHTTPClient(BaseClient):
 
     async def unlink(self, from_uri: str, to_uri: str) -> None:
         """Remove link between resources."""
+        from_uri = VikingURI.normalize(from_uri)
+        to_uri = VikingURI.normalize(to_uri)
         response = await self._http.request(
             "DELETE",
             "/api/v1/relations/link",
@@ -500,11 +654,34 @@ class AsyncHTTPClient(BaseClient):
         response = await self._http.post(f"/api/v1/sessions/{session_id}/commit")
         return self._handle_response(response)
 
-    async def add_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Add a message to a session."""
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str | None = None,
+        parts: list[dict] | None = None,
+    ) -> Dict[str, Any]:
+        """Add a message to a session.
+
+        Args:
+            session_id: Session ID
+            role: Message role ("user" or "assistant")
+            content: Text content (simple mode, backward compatible)
+            parts: Parts array (full Part support mode)
+
+        If both content and parts are provided, parts takes precedence.
+        """
+        payload: Dict[str, Any] = {"role": role}
+        if parts is not None:
+            payload["parts"] = parts
+        elif content is not None:
+            payload["content"] = content
+        else:
+            raise ValueError("Either content or parts must be provided")
+
         response = await self._http.post(
             f"/api/v1/sessions/{session_id}/messages",
-            json={"role": role, "content": content},
+            json=payload,
         )
         return self._handle_response(response)
 
@@ -512,6 +689,7 @@ class AsyncHTTPClient(BaseClient):
 
     async def export_ovpack(self, uri: str, to: str) -> str:
         """Export context as .ovpack file."""
+        uri = VikingURI.normalize(uri)
         response = await self._http.post(
             "/api/v1/pack/export",
             json={"uri": uri, "to": to},
@@ -527,14 +705,23 @@ class AsyncHTTPClient(BaseClient):
         vectorize: bool = True,
     ) -> str:
         """Import .ovpack file."""
+        parent = VikingURI.normalize(parent)
+        request_data = {
+            "parent": parent,
+            "force": force,
+            "vectorize": vectorize,
+        }
+
+        file_path_obj = Path(file_path)
+        if file_path_obj.exists() and file_path_obj.is_file() and not self._is_local_server():
+            temp_path = await self._upload_temp_file(file_path)
+            request_data["temp_path"] = temp_path
+        else:
+            request_data["file_path"] = file_path
+
         response = await self._http.post(
             "/api/v1/pack/import",
-            json={
-                "file_path": file_path,
-                "parent": parent,
-                "force": force,
-                "vectorize": vectorize,
-            },
+            json=request_data,
         )
         result = self._handle_response(response)
         return result.get("uri", "")
@@ -572,23 +759,102 @@ class AsyncHTTPClient(BaseClient):
         response = await self._http.get("/api/v1/observer/system")
         return self._handle_response(response)
 
+    # ============= Admin =============
+
+    async def admin_create_account(self, account_id: str, admin_user_id: str) -> Dict[str, Any]:
+        """Create a new account with its first admin user."""
+        response = await self._http.post(
+            "/api/v1/admin/accounts",
+            json={"account_id": account_id, "admin_user_id": admin_user_id},
+        )
+        return self._handle_response(response)
+
+    async def admin_list_accounts(self) -> List[Any]:
+        """List all accounts."""
+        response = await self._http.get("/api/v1/admin/accounts")
+        return self._handle_response(response)
+
+    async def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
+        """Delete an account and all associated users."""
+        response = await self._http.delete(f"/api/v1/admin/accounts/{account_id}")
+        return self._handle_response(response)
+
+    async def admin_register_user(
+        self, account_id: str, user_id: str, role: str = "user"
+    ) -> Dict[str, Any]:
+        """Register a new user in an account."""
+        response = await self._http.post(
+            f"/api/v1/admin/accounts/{account_id}/users",
+            json={"user_id": user_id, "role": role},
+        )
+        return self._handle_response(response)
+
+    async def admin_list_users(self, account_id: str) -> List[Any]:
+        """List all users in an account."""
+        response = await self._http.get(f"/api/v1/admin/accounts/{account_id}/users")
+        return self._handle_response(response)
+
+    async def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        """Remove a user from an account."""
+        response = await self._http.delete(f"/api/v1/admin/accounts/{account_id}/users/{user_id}")
+        return self._handle_response(response)
+
+    async def admin_set_role(self, account_id: str, user_id: str, role: str) -> Dict[str, Any]:
+        """Change a user's role."""
+        response = await self._http.put(
+            f"/api/v1/admin/accounts/{account_id}/users/{user_id}/role",
+            json={"role": role},
+        )
+        return self._handle_response(response)
+
+    async def admin_regenerate_key(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        """Regenerate a user's API key. Old key is immediately invalidated."""
+        response = await self._http.post(
+            f"/api/v1/admin/accounts/{account_id}/users/{user_id}/key",
+        )
+        return self._handle_response(response)
+
     # ============= New methods for BaseClient interface =============
 
-    def session(self, session_id: Optional[str] = None) -> Any:
+    def session(self, session_id: Optional[str] = None, must_exist: bool = False) -> Any:
         """Create a new session or load an existing one.
 
         Args:
             session_id: Session ID, creates a new session if None
+            must_exist: If True and session_id is provided, raises NotFoundError
+                        when the session does not exist.
+                        If session_id is None, must_exist is ignored.
 
         Returns:
             Session object
+
+        Raises:
+            NotFoundError: If must_exist=True and the session does not exist.
         """
         from openviking.client.session import Session
 
         if not session_id:
             result = run_async(self.create_session())
             session_id = result.get("session_id", "")
+        elif must_exist:
+            # get_session() raises NotFoundError (via _handle_response) for 404.
+            run_async(self.get_session(session_id))
         return Session(self, session_id, self._user)
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Check whether a session exists in storage.
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if the session exists, False otherwise
+        """
+        try:
+            await self.get_session(session_id)
+            return True
+        except NotFoundError:
+            return False
 
     def get_status(self) -> Dict[str, Any]:
         """Get system status.

@@ -10,7 +10,8 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
     defined(_M_IX86)
 #define OV_PLATFORM_X86
-#if defined(__AVX512F__)
+#include <immintrin.h>
+#if defined(__AVX512F__) && !defined(OV_DISABLE_AVX512)
 #define OV_SIMD_AVX512
 #endif
 #if defined(__AVX__)
@@ -18,6 +19,15 @@
 #endif
 #if defined(__SSE3__) || defined(__SSE4_2__) || defined(__SSE__)
 #define OV_SIMD_SSE
+#endif
+#endif
+
+// ARM Platform Detection
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define OV_PLATFORM_ARM
+#define OV_SIMD_NEON
+#if defined(__ARM_FEATURE_SVE)
+#define OV_SIMD_SVE
 #endif
 #endif
 

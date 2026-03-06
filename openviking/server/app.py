@@ -10,10 +10,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from openviking.server.config import ServerConfig, load_server_config
+from openviking.server.api_keys import APIKeyManager
+from openviking.server.config import ServerConfig, load_server_config, validate_server_config
 from openviking.server.dependencies import set_service
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Response
 from openviking.server.routers import (
+    admin_router,
+    bot_router,
     content_router,
     debug_router,
     filesystem_router,
@@ -48,17 +51,38 @@ def create_app(
     if config is None:
         config = load_server_config()
 
+    validate_server_config(config)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Application lifespan handler."""
         nonlocal service
         if service is None:
-            # Create and initialize service (reads config from ov.conf singleton)
             service = OpenVikingService()
             await service.initialize()
             logger.info("OpenVikingService initialized")
 
         set_service(service)
+
+        # Initialize APIKeyManager after service (needs AGFS)
+        if config.root_api_key:
+            api_key_manager = APIKeyManager(
+                root_key=config.root_api_key,
+                agfs_client=service._agfs,
+            )
+            await api_key_manager.load()
+            app.state.api_key_manager = api_key_manager
+            logger.info("APIKeyManager initialized")
+        else:
+            app.state.api_key_manager = None
+            logger.warning(
+                "Dev mode: no root_api_key configured, authentication disabled. "
+                "This is allowed because the server is bound to localhost (%s). "
+                "Do NOT expose this server to the network without configuring "
+                "server.root_api_key in ov.conf.",
+                config.host,
+            )
+
         yield
 
         # Cleanup
@@ -73,8 +97,6 @@ def create_app(
         lifespan=lifespan,
     )
 
-    # Store API key in app state for authentication
-    app.state.api_key = config.api_key
     app.state.config = config
 
     # Add CORS middleware
@@ -114,7 +136,7 @@ def create_app(
     # Catch-all for unhandled exceptions so clients always get JSON
     @app.exception_handler(Exception)
     async def general_error_handler(request: Request, exc: Exception):
-        logger.exception("Unhandled exception in request handler")
+        logger.warning("Unhandled exception: %s", exc)
         return JSONResponse(
             status_code=500,
             content=Response(
@@ -126,8 +148,18 @@ def create_app(
             ).model_dump(),
         )
 
+    # Configure Bot API if --with-bot is enabled
+    if config.with_bot:
+        import openviking.server.routers.bot as bot_module
+
+        bot_module.set_bot_api_url(config.bot_api_url)
+        logger.info(f"Bot API proxy enabled, forwarding to {config.bot_api_url}")
+    else:
+        logger.info("Bot API proxy disabled (use --with-bot to enable)")
+
     # Register routers
     app.include_router(system_router)
+    app.include_router(admin_router)
     app.include_router(resources_router)
     app.include_router(filesystem_router)
     app.include_router(content_router)
@@ -137,5 +169,6 @@ def create_app(
     app.include_router(pack_router)
     app.include_router(debug_router)
     app.include_router(observer_router)
+    app.include_router(bot_router, prefix="/bot/v1")
 
     return app

@@ -17,6 +17,7 @@ import uvicorn
 from openviking import AsyncOpenViking
 from openviking.server.app import create_app
 from openviking.server.config import ServerConfig
+from openviking.server.identity import RequestContext, Role
 from openviking.service.core import OpenVikingService
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -24,8 +25,8 @@ from openviking_cli.session.user_id import UserIdentifier
 # Paths
 # ---------------------------------------------------------------------------
 
-TEST_ROOT = Path(__file__).parent
-TEST_TMP_DIR = TEST_ROOT / ".tmp_server"
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+TEST_TMP_DIR = PROJECT_ROOT / "test_data" / "tmp_server"
 
 # ---------------------------------------------------------------------------
 # Sample data
@@ -50,11 +51,13 @@ This is a sample markdown document for server testing.
 
 @pytest.fixture(scope="function")
 def temp_dir():
-    """Create temp directory, auto-cleanup."""
-    shutil.rmtree(TEST_TMP_DIR, ignore_errors=True)
-    TEST_TMP_DIR.mkdir(parents=True, exist_ok=True)
-    yield TEST_TMP_DIR
-    shutil.rmtree(TEST_TMP_DIR, ignore_errors=True)
+    """Create a unique temp directory per test, auto-cleanup."""
+    import uuid
+
+    unique_dir = TEST_TMP_DIR / uuid.uuid4().hex[:8]
+    unique_dir.mkdir(parents=True, exist_ok=True)
+    yield unique_dir
+    shutil.rmtree(unique_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="function")
@@ -81,7 +84,7 @@ async def app(service: OpenVikingService):
     """Create FastAPI app with pre-initialized service (no auth)."""
     from openviking.server.dependencies import set_service
 
-    config = ServerConfig(api_key=None)
+    config = ServerConfig()
     fastapi_app = create_app(config=config, service=service)
     # ASGITransport doesn't trigger lifespan, so wire up the service manually
     set_service(service)
@@ -99,8 +102,10 @@ async def client(app):
 @pytest_asyncio.fixture(scope="function")
 async def client_with_resource(client, service, sample_markdown_file):
     """Client + a resource already added and processed."""
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     result = await service.resources.add_resource(
         path=str(sample_markdown_file),
+        ctx=ctx,
         reason="test resource",
         wait=True,
     )
@@ -122,7 +127,7 @@ async def running_server(temp_dir: Path):
     )
     await svc.initialize()
 
-    config = ServerConfig(api_key=None)
+    config = ServerConfig()
     fastapi_app = create_app(config=config, service=svc)
 
     # Find a free port

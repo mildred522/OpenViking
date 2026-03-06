@@ -13,6 +13,8 @@ curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/crates/o
 ### From Source
 
 ```bash
+# openviking need rust >= 1.88, please upgrade it if necessary
+# brew upgrade rust
 cargo install --path crates/ov_cli
 ```
 
@@ -103,7 +105,7 @@ ov read viking://resources/...
 ```bash
 ov --output json ls
 ov --output table ls
-ov --json ls  # Compact JSON wrapper for scripts
+ov -o json ls  # Compact JSON wrapper for scripts
 ```
 
 ## Examples
@@ -111,6 +113,12 @@ ov --json ls  # Compact JSON wrapper for scripts
 ```bash
 # Add URL and wait for processing
 ov add-resource https://example.com/docs --wait --timeout 60
+
+# Add local directory with advanced options
+ov add-resource ./dir \
+  --wait --timeout 600 \
+  --ignore-dirs "subdir-a,subdir-b/subsubdir-c" \
+  --exclude "*.tmp,*.log"
 
 # Search with threshold
 ov find "API authentication" --threshold 0.7 --limit 5
@@ -122,7 +130,7 @@ ov ls viking://resources --recursive
 ov glob "**/*.md" --uri viking://resources
 
 # Session workflow
-SESSION=$(ov session new --json | jq -r '.result.session_id')
+SESSION=$(ov -o json session new | jq -r '.result.session_id')
 ov session add-message --session-id $SESSION --role user --content "Hello"
 ov session commit --session-id $SESSION
 ```

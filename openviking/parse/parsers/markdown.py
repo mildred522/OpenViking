@@ -335,7 +335,11 @@ class MarkdownParser(BaseParser):
         return parts if parts else [content]
 
     def _sanitize_for_path(self, text: str, max_length: int = 50) -> str:
-        safe = re.sub(r"[^\w\u4e00-\u9fff\s-]", "", text)
+        safe = re.sub(
+            r"[^\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\s-]",
+            "",
+            text,
+        )
         safe = re.sub(r"\s+", "_", safe)
         safe = safe.strip("_")
         if not safe:
@@ -396,8 +400,7 @@ class MarkdownParser(BaseParser):
             logger.info("[MarkdownParser] No headings, splitting by paragraphs")
             parts = self._smart_split_content(content, max_size)
             for part_idx, part in enumerate(parts, 1):
-                part_file = f"{root_dir}/{doc_name}_{part_idx}.md"
-                await viking_fs.write_file(part_file, part)
+                await viking_fs.write_file(f"{root_dir}/{doc_name}_{part_idx}.md", part)
             logger.debug(f"[MarkdownParser] Split into {len(parts)} parts")
             return
 
@@ -525,7 +528,7 @@ class MarkdownParser(BaseParser):
 
         # Create directory and handle children or split
         section_dir = f"{parent_dir}/{name}"
-        await viking_fs.mkdir(section_dir)
+        await viking_fs.mkdir(section_dir, exist_ok=True)
 
         if has_children:
             await self._process_children(

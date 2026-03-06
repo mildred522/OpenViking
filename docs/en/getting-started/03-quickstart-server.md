@@ -4,7 +4,7 @@ Run OpenViking as a standalone HTTP server and connect from any client.
 
 ## Prerequisites
 
-- OpenViking installed (`pip install openviking`)
+- OpenViking installed (`pip install openviking --upgrade --force-reinstall`)
 - Model configuration ready (see [Quick Start](02-quickstart.md) for setup)
 
 ## Start the Server
@@ -13,13 +13,13 @@ Make sure you have a config file at `~/.openviking/ov.conf` with your model and 
 
 ```bash
 # Config file at default path ~/.openviking/ov.conf — just start
-python -m openviking serve
+openviking-server
 
 # Config file at a different location — specify with --config
-python -m openviking serve --config /path/to/ov.conf
+openviking-server --config /path/to/ov.conf
 
 # Override host/port
-python -m openviking serve --port 8000
+openviking-server --port 8000
 ```
 
 You should see:
@@ -43,12 +43,12 @@ import openviking as ov
 client = ov.SyncHTTPClient(url="http://localhost:1933")
 ```
 
-If the server has authentication enabled, pass the API key:
+If the server has authentication enabled, pass the API key and optionally an agent ID:
 
 ```python
 import openviking as ov
 
-client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key", agent_id="my-agent")
 ```
 
 **Full example:**
@@ -247,7 +247,7 @@ vim ~/.openviking/ov.conf
     "api_key"    : "<your-api-key>",   
     "provider"   : "<provider-type>",  
     "max_retries": 2,
-    "model"      : "<model-name>"      // e.g., doubao-seed-1-8-251228 or gpt-4-vision-preview
+    "model"      : "<model-name>"      // e.g., doubao-seed-2-0-pro-260215 or gpt-4-vision-preview
   }
 }
 

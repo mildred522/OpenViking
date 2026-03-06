@@ -15,19 +15,22 @@ class VLMConfig(BaseModel):
     max_retries: int = Field(default=2, description="Maximum retry attempts")
 
     provider: Optional[str] = Field(default=None, description="Provider type")
-    backend: Optional[str] = Field(default=None, description="Backend provider (Deprecated, use 'provider' instead)")
+    backend: Optional[str] = Field(
+        default=None, description="Backend provider (Deprecated, use 'provider' instead)"
+    )
 
     providers: Dict[str, Dict[str, Any]] = Field(
         default_factory=dict,
-        description="Multi-provider configuration, e.g. {'deepseek': {'api_key': 'xxx', 'api_base': 'xxx'}}"
+        description="Multi-provider configuration, e.g. {'openai': {'api_key': 'xxx', 'api_base': 'xxx'}}",
     )
 
-    default_provider: Optional[str] = Field(
-        default=None,
-        description="Default provider name"
-    )
+    default_provider: Optional[str] = Field(default=None, description="Default provider name")
 
     thinking: bool = Field(default=False, description="Enable thinking mode for VolcEngine models")
+
+    max_concurrent: int = Field(
+        default=100, description="Maximum number of concurrent LLM calls for semantic processing"
+    )
 
     _vlm_instance: Optional[Any] = None
 
@@ -86,67 +89,44 @@ class VLMConfig(BaseModel):
         return None
 
     def _match_provider(self, model: str | None = None) -> tuple[Dict[str, Any] | None, str | None]:
-        """Match provider config by model name.
+        """Match provider config.
 
         Returns:
             (provider_config_dict, provider_name)
         """
-        from openviking.models.vlm.registry import PROVIDERS
-
-        model_lower = (model or self.model or "").lower()
-
         if self.provider:
             p = self.providers.get(self.provider)
             if p and p.get("api_key"):
                 return p, self.provider
 
-        for spec in PROVIDERS:
-            p = self.providers.get(spec.name)
-            if p and any(kw in model_lower for kw in spec.keywords) and p.get("api_key"):
-                return p, spec.name
-
-        for spec in PROVIDERS:
-            if spec.is_gateway:
-                p = self.providers.get(spec.name)
-                if p and p.get("api_key"):
-                    return p, spec.name
-
-        for spec in PROVIDERS:
-            if not spec.is_gateway:
-                p = self.providers.get(spec.name)
-                if p and p.get("api_key"):
-                    return p, spec.name
+        for name, config in self.providers.items():
+            if config.get("api_key"):
+                return config, name
 
         return None, None
 
     def get_provider_config(
         self, model: str | None = None
-    ) -> tuple[Dict[str, Any] | None, str | None, "Any | None"]:
-        """Get provider config and spec.
+    ) -> tuple[Dict[str, Any] | None, str | None]:
+        """Get provider config.
 
         Returns:
-            (provider_config_dict, provider_name, ProviderSpec)
+            (provider_config_dict, provider_name)
         """
-        from openviking.models.vlm.registry import find_by_name, find_gateway
-
-        config, name = self._match_provider(model)
-        if config and name:
-            spec = find_by_name(name)
-            gateway = find_gateway(name, config.get("api_key"), config.get("api_base"))
-            return config, name, gateway or spec
-        return None, None, None
+        return self._match_provider(model)
 
     def get_vlm_instance(self) -> Any:
         """Get VLM instance."""
         if self._vlm_instance is None:
             config_dict = self._build_vlm_config_dict()
             from openviking.models.vlm import VLMFactory
+
             self._vlm_instance = VLMFactory.create(config_dict)
         return self._vlm_instance
 
     def _build_vlm_config_dict(self) -> Dict[str, Any]:
         """Build VLM instance config dict."""
-        config, name, spec = self.get_provider_config()
+        config, name = self.get_provider_config()
 
         result = {
             "model": self.model,
@@ -161,18 +141,17 @@ class VLMConfig(BaseModel):
             result["api_base"] = config.get("api_base")
             result["extra_headers"] = config.get("extra_headers")
 
-        if spec and not result.get("api_base") and spec.default_api_base:
-            result["api_base"] = spec.default_api_base
-
         return result
 
-    def get_completion(self, prompt: str) -> str:
+    def get_completion(self, prompt: str, thinking: bool = False) -> str:
         """Get LLM completion."""
-        return self.get_vlm_instance().get_completion(prompt)
+        return self.get_vlm_instance().get_completion(prompt, thinking)
 
-    async def get_completion_async(self, prompt: str, max_retries: int = 0) -> str:
+    async def get_completion_async(
+        self, prompt: str, thinking: bool = False, max_retries: int = 0
+    ) -> str:
         """Get LLM completion asynchronously, max_retries=0 means no retry."""
-        return await self.get_vlm_instance().get_completion_async(prompt, max_retries)
+        return await self.get_vlm_instance().get_completion_async(prompt, thinking, max_retries)
 
     def is_available(self) -> bool:
         """Check if LLM is configured."""
@@ -182,14 +161,16 @@ class VLMConfig(BaseModel):
         self,
         prompt: str,
         images: list,
+        thinking: bool = False,
     ) -> str:
         """Get LLM completion with images."""
-        return self.get_vlm_instance().get_vision_completion(prompt, images)
+        return self.get_vlm_instance().get_vision_completion(prompt, images, thinking)
 
     async def get_vision_completion_async(
         self,
         prompt: str,
         images: list,
+        thinking: bool = False,
     ) -> str:
         """Get LLM completion with images asynchronously."""
-        return await self.get_vlm_instance().get_vision_completion_async(prompt, images)
+        return await self.get_vlm_instance().get_vision_completion_async(prompt, images, thinking)

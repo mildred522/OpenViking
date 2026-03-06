@@ -19,7 +19,7 @@ Create `~/.openviking/ov.conf` in your project directory:
   "vlm": {
     "provider": "volcengine",
     "api_key": "your-api-key",
-    "model": "doubao-seed-1-8-251228"
+    "model": "doubao-seed-2-0-pro-260215"
   },
   "rerank": {
     "provider": "volcengine",
@@ -27,14 +27,9 @@ Create `~/.openviking/ov.conf` in your project directory:
     "model": "doubao-rerank-250615"
   },
   "storage": {
-    "agfs": {
-      "backend": "local",
-      "path": "./data"
-    },
-    "vectordb": {
-      "backend": "local",
-      "path": "./data"
-    }
+    "workspace": "./data",
+    "agfs": { "backend": "local" },
+    "vectordb": { "backend": "local" }
   }
 }
 ```
@@ -60,7 +55,7 @@ Create `~/.openviking/ov.conf` in your project directory:
     "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
     "api_key"  : "your-volcengine-api-key",
     "provider" : "volcengine",
-    "model"    : "doubao-seed-1-8-251228"
+    "model"    : "doubao-seed-2-0-pro-260215"
   }
 }
 ```
@@ -103,6 +98,7 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 ```json
 {
   "embedding": {
+    "max_concurrent": 10,
     "dense": {
       "provider": "volcengine",
       "api_key": "your-api-key",
@@ -118,7 +114,8 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `provider` | str | `"volcengine"`, `"openai"`, or `"vikingdb"` |
+| `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`) |
+| `provider` | str | `"volcengine"`, `"openai"`, `"vikingdb"`, or `"jina"` |
 | `api_key` | str | API key |
 | `model` | str | Model name |
 | `dimension` | int | Vector dimension |
@@ -138,6 +135,7 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 - `openai`: OpenAI Embedding API
 - `volcengine`: Volcengine Embedding API
 - `vikingdb`: VikingDB Embedding API
+- `jina`: Jina AI Embedding API
 
 **vikingdb provider example:**
 
@@ -151,6 +149,43 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
       "sk": "your-secret-key",
       "region": "cn-beijing",
       "dimension": 1024
+    }
+  }
+}
+```
+
+**jina provider example:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "jina",
+      "api_key": "jina_xxx",
+      "model": "jina-embeddings-v5-text-small",
+      "dimension": 1024
+    }
+  }
+}
+```
+
+Available Jina models:
+- `jina-embeddings-v5-text-small`: 677M params, 1024 dim, max seq 32768 (default)
+- `jina-embeddings-v5-text-nano`: 239M params, 768 dim, max seq 8192
+
+Get your API key at https://jina.ai
+
+**Local deployment (GGUF/MLX):** Jina embedding models are open-weight and available in GGUF and MLX formats on [Hugging Face](https://huggingface.co/jinaai). You can run them locally with any OpenAI-compatible server (e.g. llama.cpp, MLX, vLLM) and point the `api_base` to your local endpoint:
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "jina",
+      "api_key": "local",
+      "api_base": "http://localhost:8080/v1",
+      "model": "jina-embeddings-v5-text-nano",
+      "dimension": 768
     }
   }
 }
@@ -217,8 +252,8 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 {
   "vlm": {
     "api_key": "your-api-key",
-    "model": "doubao-seed-1-8-251228",
-    "base_url": "https://ark.cn-beijing.volces.com/api/v3"
+    "model": "doubao-seed-2-0-pro-260215",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3"
   }
 }
 ```
@@ -229,13 +264,15 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 |-----------|------|-------------|
 | `api_key` | str | API key |
 | `model` | str | Model name |
-| `base_url` | str | API endpoint (optional) |
+| `api_base` | str | API endpoint (optional) |
+| `thinking` | bool | Enable thinking mode for VolcEngine models (default: `false`) |
+| `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `100`) |
 
 **Available Models**
 
 | Model | Notes |
 |-------|-------|
-| `doubao-seed-1-8-251228` | Recommended for semantic extraction |
+| `doubao-seed-2-0-pro-260215` | Recommended for semantic extraction |
 | `doubao-pro-32k` | For longer context |
 
 When resources are added, VLM generates:
@@ -244,6 +281,40 @@ When resources are added, VLM generates:
 2. **L1 (Overview)**: ~2k token overview with navigation
 
 If VLM is not configured, L0/L1 will be generated from content directly (less semantic), and multimodal resources may have limited descriptions.
+
+### code
+
+Controls how code files are summarized via `code_summary_mode`. Both config formats are equivalent:
+
+```json
+{
+  "code": {
+    "code_summary_mode": "ast"
+  }
+}
+```
+
+```json
+{
+  "parsers": {
+    "code": {
+      "code_summary_mode": "ast"
+    }
+  }
+}
+```
+
+Set `code_summary_mode` to one of:
+
+| Value | Description | Default |
+|-------|-------------|---------|
+| `"ast"` | Extract AST skeleton (class names, method signatures, first-line docstrings, imports) for files ≥100 lines, skip LLM calls. **Recommended for large-scale code indexing** | ✓ |
+| `"llm"` | Always use LLM for summarization (higher cost) | |
+| `"ast_llm"` | Extract AST skeleton (with full docstrings) first, then pass it as context to LLM (highest quality, moderate cost) | |
+
+AST extraction supports: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++. Other languages, extraction failures, or empty skeletons automatically fall back to LLM.
+
+See [Code Skeleton Extraction](../concepts/06-extraction.md#code-skeleton-extraction-ast-mode) for details.
 
 ### rerank
 
@@ -269,23 +340,194 @@ If rerank is not configured, search uses vector similarity only.
 
 ### storage
 
-Storage backend configuration.
+Storage configuration for context data, including file storage (AGFS) and vector database storage (VectorDB).
+
+#### Root Configuration
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `workspace` | str | Local data storage path (main configuration) | "./data" |
+| `agfs` | object | AGFS configuration | {} |
+| `vectordb` | object | Vector database storage configuration | {} |
+
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "timeout": 10
+    },
+    "vectordb": {
+      "backend": "local"
+    }
+  }
+}
+```
+
+#### agfs
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `mode` | str | `"http-client"` or `"binding-client"` | `"http-client"` |
+| `backend` | str | `"local"`, `"s3"`, or `"memory"` | `"local"` |
+| `url` | str | AGFS service URL for `http-client` mode | `"http://localhost:1833"` |
+| `timeout` | float | Request timeout in seconds | `10.0` |
+| `s3` | object | S3 backend configuration (when backend is 's3') | - |
+
+**Configuration Examples**
+
+<details>
+<summary><b>HTTP Client (Default)</b></summary>
+
+Connects to a remote or local AGFS service via HTTP.
 
 ```json
 {
   "storage": {
     "agfs": {
-      "backend": "local",
-      "path": "./data",
-      "timeout": 30.0
-    },
-    "vectordb": {
-      "backend": "local",
-      "path": "./data"
+      "mode": "http-client",
+      "url": "http://localhost:1833",
+      "timeout": 10.0
     }
   }
 }
 ```
+
+</details>
+
+<details>
+<summary><b>Binding Client (High Performance)</b></summary>
+
+Directly uses the AGFS Go implementation through a shared library. 
+
+**Config**:
+```json
+{
+  "storage": {
+    "agfs": {
+      "mode": "binding-client",
+      "backend": "local"
+    }
+  }
+}
+```
+
+</details>
+
+
+##### S3 Backend Configuration
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `bucket` | str | S3 bucket name | null |
+| `region` | str | AWS region where the bucket is located (e.g., us-east-1, cn-beijing) | null |
+| `access_key` | str | S3 access key ID | null |
+| `secret_key` | str | S3 secret access key corresponding to the access key ID | null |
+| `endpoint` | str | Custom S3 endpoint URL, required for S3-compatible services like MinIO or LocalStack | null |
+| `prefix` | str | Optional key prefix for namespace isolation | "" |
+| `use_ssl` | bool | Enable/disable SSL (HTTPS) for S3 connections | true |
+| `use_path_style` | bool | true for PathStyle used by MinIO and some S3-compatible services; false for VirtualHostStyle used by TOS and some S3-compatible services | true |
+
+</details>
+
+<details>
+<summary><b>PathStyle S3</b></summary>
+Supports S3 storage in PathStyle mode, such as MinIO, SeaweedFS.
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "backend": "s3",
+      "s3": {
+        "bucket": "my-bucket",
+        "endpoint": "s3.amazonaws.com",
+        "region": "us-east-1",
+        "access_key": "your-ak",
+        "secret_key": "your-sk"
+      }
+    }
+  }
+}
+```
+</details>
+
+
+<details>
+<summary><b>VirtualHostStyle S3</b></summary>
+Supports S3 storage in VirtualHostStyle mode, such as TOS.
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "backend": "s3",
+      "s3": {
+        "bucket": "my-bucket",
+        "endpoint": "s3.amazonaws.com",
+        "region": "us-east-1",
+        "access_key": "your-ak",
+        "secret_key": "your-sk",
+        "use_path_style": false
+      }
+    }
+  }
+}
+```
+
+</details>
+
+
+#### vectordb
+
+Vector database storage configuration
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (cloud VikingDB), or 'vikingdb' (private deployment) | "local" |
+| `name` | str | VectorDB collection name | "context" |
+| `url` | str | Remote service URL for 'http' type (e.g., 'http://localhost:5000') | null |
+| `project_name` | str | Project name (alias project) | "default" |
+| `distance_metric` | str | Distance metric for vector similarity search (e.g., 'cosine', 'l2', 'ip') | "cosine" |
+| `dimension` | int | Vector embedding dimension | 0 |
+| `sparse_weight` | float | Sparse weight for hybrid vector search, only effective when using hybrid index | 0.0 |
+| `volcengine` | object | 'volcengine' type VikingDB configuration | - |
+| `vikingdb` | object | 'vikingdb' type private deployment configuration | - |
+
+Default local mode
+```
+{
+  "storage": {
+    "vectordb": {
+      "backend": "local"
+    }
+  }
+}
+```
+
+<details>
+<summary><b>volcengine vikingDB</b></summary>
+Supports cloud-deployed VikingDB on Volcengine
+
+```json
+{
+  "storage": {
+    "vectordb": {
+      "name": "context",
+      "backend": "volcengine",
+      "project": "default",
+      "volcengine": {
+        "region": "cn-beijing",
+        "ak": "your-access-key",
+        "sk": "your-secret-key"
+      }
+  }
+}
+```
+</details>
+
 
 ## Config Files
 
@@ -306,7 +548,7 @@ export OPENVIKING_CONFIG_FILE=/path/to/ov.conf
 export OPENVIKING_CLI_CONFIG_FILE=/path/to/ovcli.conf
 
 # Option 2: Command-line argument (serve command only)
-python -m openviking serve --config /path/to/ov.conf
+openviking-server --config /path/to/ov.conf
 ```
 
 ### ov.conf
@@ -321,6 +563,7 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
 {
   "url": "http://localhost:1933",
   "api_key": "your-secret-key",
+  "agent_id": "my-agent",
   "output": "table"
 }
 ```
@@ -328,7 +571,8 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
 | Field | Description | Default |
 |-------|-------------|---------|
 | `url` | Server address | (required) |
-| `api_key` | API key for authentication | `null` (no auth) |
+| `api_key` | API key for authentication (root key or user key) | `null` (no auth) |
+| `agent_id` | Agent identifier for agent space isolation | `null` |
 | `output` | Default output format: `"table"` or `"json"` | `"table"` |
 
 See [Deployment](./03-deployment.md) for details.
@@ -342,7 +586,7 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
   "server": {
     "host": "0.0.0.0",
     "port": 1933,
-    "api_key": "your-secret-key",
+    "root_api_key": "your-secret-root-key",
     "cors_origins": ["*"]
   }
 }
@@ -352,8 +596,10 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 |-------|------|-------------|---------|
 | `host` | str | Bind address | `0.0.0.0` |
 | `port` | int | Bind port | `1933` |
-| `api_key` | str | API Key auth, disabled if not set | `null` |
+| `root_api_key` | str | Root API key for multi-tenant auth, disabled if not set | `null` |
 | `cors_origins` | list | Allowed CORS origins | `["*"]` |
+
+When `root_api_key` is configured, the server enables multi-tenant authentication. Use the Admin API to create accounts and user keys. When not set, the server runs in dev mode with no authentication.
 
 For startup and deployment details see [Deployment](./03-deployment.md), for authentication see [Authentication](./04-authentication.md).
 
@@ -362,6 +608,7 @@ For startup and deployment details see [Deployment](./03-deployment.md), for aut
 ```json
 {
   "embedding": {
+    "max_concurrent": 10,
     "dense": {
       "provider": "volcengine",
       "api_key": "string",
@@ -374,7 +621,9 @@ For startup and deployment details see [Deployment](./03-deployment.md), for aut
     "provider": "string",
     "api_key": "string",
     "model": "string",
-    "base_url": "string"
+    "api_base": "string",
+    "thinking": false,
+    "max_concurrent": 100
   },
   "rerank": {
     "provider": "volcengine",
@@ -382,22 +631,25 @@ For startup and deployment details see [Deployment](./03-deployment.md), for aut
     "model": "string"
   },
   "storage": {
+    "workspace": "string",
     "agfs": {
-      "backend": "local|remote",
-      "path": "string",
+      "backend": "local|s3|memory",
       "url": "string",
-      "timeout": 30.0
+      "timeout": 10
     },
     "vectordb": {
       "backend": "local|remote",
-      "path": "string",
-      "url": "string"
+      "url": "string",
+      "project": "string"
     }
+  },
+  "code": {
+    "code_summary_mode": "ast"
   },
   "server": {
     "host": "0.0.0.0",
     "port": 1933,
-    "api_key": "string",
+    "root_api_key": "string",
     "cors_origins": ["*"]
   }
 }
@@ -444,7 +696,7 @@ Volcengine has rate limits. Consider batch processing with delays or upgrading y
 
 ## Related Documentation
 
-- [Volcengine Purchase Guide](./volcengine-purchase-guide.md) - API key setup
+- [Volcengine Purchase Guide](./02-volcengine-purchase-guide.md) - API key setup
 - [API Overview](../api/01-overview.md) - Client initialization
 - [Server Deployment](./03-deployment.md) - Server configuration
 - [Context Layers](../concepts/03-context-layers.md) - L0/L1/L2

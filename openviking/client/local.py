@@ -7,9 +7,11 @@ Implements BaseClient interface using direct service calls (embedded mode).
 
 from typing import Any, Dict, List, Optional, Union
 
+from openviking.server.identity import RequestContext, Role
 from openviking.service import OpenVikingService
 from openviking_cli.client.base import BaseClient
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils import run_async
 
 
 class LocalClient(BaseClient):
@@ -32,6 +34,7 @@ class LocalClient(BaseClient):
             user=UserIdentifier.the_default_user(),
         )
         self._user = self._service.user
+        self._ctx = RequestContext(user=self._user, role=Role.ROOT)
 
     @property
     def service(self) -> OpenVikingService:
@@ -63,6 +66,7 @@ class LocalClient(BaseClient):
         """Add resource to OpenViking."""
         return await self._service.resources.add_resource(
             path=path,
+            ctx=self._ctx,
             target=target,
             reason=reason,
             instruction=instruction,
@@ -80,6 +84,7 @@ class LocalClient(BaseClient):
         """Add skill to OpenViking."""
         return await self._service.resources.add_skill(
             data=data,
+            ctx=self._ctx,
             wait=wait,
             timeout=timeout,
         )
@@ -87,6 +92,18 @@ class LocalClient(BaseClient):
     async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Wait for all processing to complete."""
         return await self._service.resources.wait_processed(timeout=timeout)
+
+    async def build_index(self, resource_uris: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
+        """Manually trigger index building."""
+        if isinstance(resource_uris, str):
+            resource_uris = [resource_uris]
+        return await self._service.resources.build_index(resource_uris, ctx=self._ctx, **kwargs)
+
+    async def summarize(self, resource_uris: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
+        """Manually trigger summarization."""
+        if isinstance(resource_uris, str):
+            resource_uris = [resource_uris]
+        return await self._service.resources.summarize(resource_uris, ctx=self._ctx, **kwargs)
 
     # ============= File System =============
 
@@ -102,6 +119,7 @@ class LocalClient(BaseClient):
         """List directory contents."""
         return await self._service.fs.ls(
             uri,
+            ctx=self._ctx,
             simple=simple,
             recursive=recursive,
             output=output,
@@ -120,6 +138,7 @@ class LocalClient(BaseClient):
         """Get directory tree."""
         return await self._service.fs.tree(
             uri,
+            ctx=self._ctx,
             output=output,
             abs_limit=abs_limit,
             show_all_hidden=show_all_hidden,
@@ -128,33 +147,39 @@ class LocalClient(BaseClient):
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         """Get resource status."""
-        return await self._service.fs.stat(uri)
+        return await self._service.fs.stat(uri, ctx=self._ctx)
 
     async def mkdir(self, uri: str) -> None:
         """Create directory."""
-        await self._service.fs.mkdir(uri)
+        await self._service.fs.mkdir(uri, ctx=self._ctx)
 
     async def rm(self, uri: str, recursive: bool = False) -> None:
         """Remove resource."""
-        await self._service.fs.rm(uri, recursive=recursive)
+        await self._service.fs.rm(uri, ctx=self._ctx, recursive=recursive)
 
     async def mv(self, from_uri: str, to_uri: str) -> None:
         """Move resource."""
-        await self._service.fs.mv(from_uri, to_uri)
+        await self._service.fs.mv(from_uri, to_uri, ctx=self._ctx)
 
     # ============= Content Reading =============
 
-    async def read(self, uri: str) -> str:
-        """Read file content."""
-        return await self._service.fs.read(uri)
+    async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+        """Read file content.
+
+        Args:
+            uri: Viking URI
+            offset: Starting line number (0-indexed). Default 0.
+            limit: Number of lines to read. -1 means read to end. Default -1.
+        """
+        return await self._service.fs.read(uri, ctx=self._ctx, offset=offset, limit=limit)
 
     async def abstract(self, uri: str) -> str:
         """Read L0 abstract."""
-        return await self._service.fs.abstract(uri)
+        return await self._service.fs.abstract(uri, ctx=self._ctx)
 
     async def overview(self, uri: str) -> str:
         """Read L1 overview."""
-        return await self._service.fs.overview(uri)
+        return await self._service.fs.overview(uri, ctx=self._ctx)
 
     # ============= Search =============
 
@@ -169,6 +194,7 @@ class LocalClient(BaseClient):
         """Semantic search without session context."""
         return await self._service.search.find(
             query=query,
+            ctx=self._ctx,
             target_uri=target_uri,
             limit=limit,
             score_threshold=score_threshold,
@@ -187,10 +213,11 @@ class LocalClient(BaseClient):
         """Semantic search with optional session context."""
         session = None
         if session_id:
-            session = self._service.sessions.session(session_id)
-            session.load()
+            session = self._service.sessions.session(self._ctx, session_id)
+            await session.load()
         return await self._service.search.search(
             query=query,
+            ctx=self._ctx,
             target_uri=target_uri,
             session=session,
             limit=limit,
@@ -200,31 +227,33 @@ class LocalClient(BaseClient):
 
     async def grep(self, uri: str, pattern: str, case_insensitive: bool = False) -> Dict[str, Any]:
         """Content search with pattern."""
-        return await self._service.fs.grep(uri, pattern, case_insensitive=case_insensitive)
+        return await self._service.fs.grep(
+            uri, pattern, ctx=self._ctx, case_insensitive=case_insensitive
+        )
 
     async def glob(self, pattern: str, uri: str = "viking://") -> Dict[str, Any]:
         """File pattern matching."""
-        return await self._service.fs.glob(pattern, uri=uri)
+        return await self._service.fs.glob(pattern, ctx=self._ctx, uri=uri)
 
     # ============= Relations =============
 
     async def relations(self, uri: str) -> List[Any]:
         """Get relations for a resource."""
-        return await self._service.relations.relations(uri)
+        return await self._service.relations.relations(uri, ctx=self._ctx)
 
     async def link(self, from_uri: str, to_uris: Union[str, List[str]], reason: str = "") -> None:
         """Create link between resources."""
-        await self._service.relations.link(from_uri, to_uris, reason)
+        await self._service.relations.link(from_uri, to_uris, ctx=self._ctx, reason=reason)
 
     async def unlink(self, from_uri: str, to_uri: str) -> None:
         """Remove link between resources."""
-        await self._service.relations.unlink(from_uri, to_uri)
+        await self._service.relations.unlink(from_uri, to_uri, ctx=self._ctx)
 
     # ============= Sessions =============
 
     async def create_session(self) -> Dict[str, Any]:
         """Create a new session."""
-        session = self._service.sessions.session()
+        session = await self._service.sessions.create(self._ctx)
         return {
             "session_id": session.session_id,
             "user": session.user.to_dict(),
@@ -232,12 +261,11 @@ class LocalClient(BaseClient):
 
     async def list_sessions(self) -> List[Any]:
         """List all sessions."""
-        return await self._service.sessions.sessions()
+        return await self._service.sessions.sessions(self._ctx)
 
     async def get_session(self, session_id: str) -> Dict[str, Any]:
         """Get session details."""
-        session = self._service.sessions.session(session_id)
-        session.load()
+        session = await self._service.sessions.get(session_id, self._ctx)
         return {
             "session_id": session.session_id,
             "user": session.user.to_dict(),
@@ -246,17 +274,43 @@ class LocalClient(BaseClient):
 
     async def delete_session(self, session_id: str) -> None:
         """Delete a session."""
-        await self._service.sessions.delete(session_id)
+        await self._service.sessions.delete(session_id, self._ctx)
 
     async def commit_session(self, session_id: str) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
-        return await self._service.sessions.commit(session_id)
+        return await self._service.sessions.commit(session_id, self._ctx)
 
-    async def add_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Add a message to a session."""
-        session = self._service.sessions.session(session_id)
-        session.load()
-        session.add_message(role, content)
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: Optional[str] = None,
+        parts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Add a message to a session.
+
+        Args:
+            session_id: Session ID
+            role: Message role ("user" or "assistant")
+            content: Text content (simple mode, backward compatible)
+            parts: Parts array (full Part support mode)
+
+        If both content and parts are provided, parts takes precedence.
+        """
+        from openviking.message.part import Part, TextPart, part_from_dict
+
+        session = self._service.sessions.session(self._ctx, session_id)
+        await session.load()
+
+        message_parts: list[Part]
+        if parts is not None:
+            message_parts = [part_from_dict(p) for p in parts]
+        elif content is not None:
+            message_parts = [TextPart(text=content)]
+        else:
+            raise ValueError("Either content or parts must be provided")
+
+        session.add_message(role, message_parts)
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
@@ -266,7 +320,7 @@ class LocalClient(BaseClient):
 
     async def export_ovpack(self, uri: str, to: str) -> str:
         """Export context as .ovpack file."""
-        return await self._service.pack.export_ovpack(uri, to)
+        return await self._service.pack.export_ovpack(uri, to, ctx=self._ctx)
 
     async def import_ovpack(
         self,
@@ -277,7 +331,7 @@ class LocalClient(BaseClient):
     ) -> str:
         """Import .ovpack file."""
         return await self._service.pack.import_ovpack(
-            file_path, parent, force=force, vectorize=vectorize
+            file_path, parent, ctx=self._ctx, force=force, vectorize=vectorize
         )
 
     # ============= Debug =============
@@ -286,24 +340,40 @@ class LocalClient(BaseClient):
         """Check service health."""
         return True  # Local service is always healthy if initialized
 
-    def session(self, session_id: Optional[str] = None) -> Any:
+    def session(self, session_id: Optional[str] = None, must_exist: bool = False) -> Any:
         """Create a new session or load an existing one.
 
         Args:
             session_id: Session ID, creates a new session if None
+            must_exist: If True and session_id is provided, raises NotFoundError
+                        when the session does not exist.
+                        If session_id is None, must_exist is ignored.
 
         Returns:
             Session object
-        """
-        from openviking.session import Session
 
-        return Session(
-            viking_fs=self._service.viking_fs,
-            vikingdb_manager=self._service.vikingdb_manager,
-            session_compressor=self._service.session_compressor,
-            user=self._user,
-            session_id=session_id,
-        )
+        Raises:
+            NotFoundError: If must_exist=True and the session does not exist.
+        """
+        session = self._service.sessions.session(self._ctx, session_id)
+        if must_exist and session_id:
+            if not run_async(session.exists()):
+                from openviking_cli.exceptions import NotFoundError
+
+                raise NotFoundError(session_id, "session")
+        return session
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Check whether a session exists in storage.
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if the session exists, False otherwise
+        """
+        session = self._service.sessions.session(self._ctx, session_id)
+        return await session.exists()
 
     def get_status(self) -> Any:
         """Get system status.

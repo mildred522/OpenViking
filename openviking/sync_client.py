@@ -4,6 +4,7 @@
 Synchronous OpenViking client implementation.
 """
 
+from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -28,9 +29,13 @@ class SyncOpenViking:
         run_async(self._async_client.initialize())
         self._initialized = True
 
-    def session(self, session_id: Optional[str] = None) -> "Session":
+    def session(self, session_id: Optional[str] = None, must_exist: bool = False) -> "Session":
         """Create new session or load existing session."""
-        return self._async_client.session(session_id)
+        return self._async_client.session(session_id, must_exist=must_exist)
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check whether a session exists in storage."""
+        return run_async(self._async_client.session_exists(session_id))
 
     def create_session(self) -> Dict[str, Any]:
         """Create a new session."""
@@ -48,9 +53,24 @@ class SyncOpenViking:
         """Delete a session."""
         run_async(self._async_client.delete_session(session_id))
 
-    def add_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Add a message to a session."""
-        return run_async(self._async_client.add_message(session_id, role, content))
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str | None = None,
+        parts: list[dict] | None = None,
+    ) -> Dict[str, Any]:
+        """Add a message to a session.
+
+        Args:
+            session_id: Session ID
+            role: Message role ("user" or "assistant")
+            content: Text content (simple mode)
+            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+
+        If both content and parts are provided, parts takes precedence.
+        """
+        return run_async(self._async_client.add_message(session_id, role, content, parts))
 
     def commit_session(self, session_id: str) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
@@ -64,22 +84,28 @@ class SyncOpenViking:
         instruction: str = "",
         wait: bool = False,
         timeout: float = None,
+        build_index: bool = True,
+        summarize: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking (resources scope only)
 
         Args:
+            build_index: Whether to build vector index immediately (default: True).
+            summarize: Whether to generate summary (default: False).
             **kwargs: Extra options forwarded to the parser chain, e.g.
                 ``strict``, ``ignore_dirs``, ``include``, ``exclude``.
         """
         return run_async(
             self._async_client.add_resource(
-                path,
-                target,
-                reason,
-                instruction,
-                wait,
-                timeout,
+                path=path,
+                target=target,
+                reason=reason,
+                instruction=instruction,
+                wait=wait,
+                timeout=timeout,
+                build_index=build_index,
+                summarize=summarize,
                 **kwargs,
             )
         )
@@ -128,9 +154,9 @@ class SyncOpenViking:
         """Read L1 overview"""
         return run_async(self._async_client.overview(uri))
 
-    def read(self, uri: str) -> str:
+    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         """Read file"""
-        return run_async(self._async_client.read(uri))
+        return run_async(self._async_client.read(uri, offset=offset, limit=limit))
 
     def ls(self, uri: str, **kwargs) -> List[Any]:
         """

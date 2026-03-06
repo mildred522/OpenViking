@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unified resource processor with strategy-based routing."""
 
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -58,7 +60,7 @@ class UnifiedResourceProcessor:
             if path.exists():
                 if path.is_dir():
                     return await self._process_directory(path, instruction, **kwargs)
-                return await self._process_file(path, instruction)
+                return await self._process_file(path, instruction, **kwargs)
             else:
                 logger.warning(f"Path {path} does not exist")
                 raise FileNotFoundError(f"Path {path} does not exist")
@@ -68,10 +70,23 @@ class UnifiedResourceProcessor:
 
     def _is_url(self, source: str) -> bool:
         """Check if source is a URL."""
-        return source.startswith(("http://", "https://"))
+        return source.startswith(("http://", "https://", "git@", "ssh://", "git://"))
 
-    async def _process_url(self, url: str, instruction: str) -> ParseResult:
+    async def _process_url(self, url: str, instruction: str, **kwargs) -> ParseResult:
         """Process URL source."""
+        from openviking.utils.code_hosting_utils import is_git_repo_url, validate_git_ssh_uri
+
+        # Validate git@ SSH URIs early
+        if url.startswith("git@"):
+            validate_git_ssh_uri(url)
+
+        # Route git protocols and repo URLs to CodeRepositoryParser
+        if url.startswith(("git@", "git://", "ssh://")) or is_git_repo_url(url):
+            from openviking.parse.parsers.code.code import CodeRepositoryParser
+
+            parser = CodeRepositoryParser()
+            return await parser.parse(url, instruction=instruction)
+
         from openviking.parse.parsers.html import HTMLParser
 
         parser = HTMLParser()
@@ -101,8 +116,19 @@ class UnifiedResourceProcessor:
         self,
         file_path: Path,
         instruction: str,
+        **kwargs,
     ) -> ParseResult:
         """Process file with unified parsing."""
+        ext = file_path.suffix.lower()
+        # Only treat .zip files as archives to extract.
+        if ext == ".zip" and zipfile.is_zipfile(file_path):
+            temp_dir = Path(tempfile.mkdtemp())
+            try:
+                with zipfile.ZipFile(file_path, "r") as zipf:
+                    zipf.extractall(temp_dir)
+                return await self._process_directory(temp_dir, instruction, **kwargs)
+            finally:
+                pass  # Don't delete temp_dir yet, it will be used by TreeBuilder
         return await parse(
             str(file_path),
             instruction=instruction,

@@ -5,23 +5,25 @@ OpenViking 异步客户端示例 (HTTP mode)
 使用 AsyncHTTPClient 通过 HTTP 连接远程 Server，演示完整 API。
 
 前置条件:
-    先启动 Server: openviking serve
+    先启动 Server: openviking-server
 
 运行:
     uv run client_async.py
     uv run client_async.py --url http://localhost:1933
     uv run client_async.py --api-key your-secret-key
+    uv run client_async.py --agent-id my-agent
 """
 
 import argparse
 import asyncio
 
-import openviking as ov
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+import openviking as ov
 
 console = Console()
 PANEL_WIDTH = 78
@@ -35,17 +37,24 @@ async def main():
     parser = argparse.ArgumentParser(description="OpenViking async client example")
     parser.add_argument("--url", default="http://localhost:1933", help="Server URL")
     parser.add_argument("--api-key", default=None, help="API key")
+    parser.add_argument("--agent-id", default=None, help="Agent ID")
+    parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
     args = parser.parse_args()
 
-    client = ov.AsyncHTTPClient(url=args.url, api_key=args.api_key)
+    client = ov.AsyncHTTPClient(
+        url=args.url, api_key=args.api_key, agent_id=args.agent_id, timeout=args.timeout
+    )
 
     try:
         # ── Connect ──
         await client.initialize()
-        console.print(Panel(
-            f"Connected to [bold cyan]{args.url}[/bold cyan]",
-            style="green", width=PANEL_WIDTH,
-        ))
+        console.print(
+            Panel(
+                f"Connected to [bold cyan]{args.url}[/bold cyan]",
+                style="green",
+                width=PANEL_WIDTH,
+            )
+        )
         console.print()
 
         # ── System Status ──
@@ -100,18 +109,24 @@ async def main():
             console.print(Panel("Content", style="bold magenta", width=PANEL_WIDTH))
             with console.status("Fetching abstract..."):
                 abstract = await client.abstract(root_uri)
-            console.print(Panel(
-                Text(abstract[:300] + ("..." if len(abstract) > 300 else ""),
-                     style="white"),
-                title="Abstract", style="dim", width=PANEL_WIDTH,
-            ))
+            console.print(
+                Panel(
+                    Text(abstract[:300] + ("..." if len(abstract) > 300 else ""), style="white"),
+                    title="Abstract",
+                    style="dim",
+                    width=PANEL_WIDTH,
+                )
+            )
             with console.status("Fetching overview..."):
                 overview = await client.overview(root_uri)
-            console.print(Panel(
-                Text(overview[:300] + ("..." if len(overview) > 300 else ""),
-                     style="white"),
-                title="Overview", style="dim", width=PANEL_WIDTH,
-            ))
+            console.print(
+                Panel(
+                    Text(overview[:300] + ("..." if len(overview) > 300 else ""), style="white"),
+                    title="Overview",
+                    style="dim",
+                    width=PANEL_WIDTH,
+                )
+            )
             console.print()
 
         # ── Semantic Search (find) ──
@@ -120,7 +135,9 @@ async def main():
             results = await client.find("what is openviking", limit=3)
         if hasattr(results, "resources") and results.resources:
             search_table = Table(
-                box=box.ROUNDED, show_header=True, header_style="bold green",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold green",
             )
             search_table.add_column("#", style="cyan", width=4)
             search_table.add_column("URI", style="white")
@@ -157,14 +174,13 @@ async def main():
 
         with console.status("Searching with session context..."):
             ctx_results = await client.search(
-                "how to use it", session=session, limit=3,
+                "how to use it",
+                session=session,
+                limit=3,
             )
         if hasattr(ctx_results, "resources") and ctx_results.resources:
             for r in ctx_results.resources:
-                console.print(
-                    f"  [cyan]{r.uri}[/cyan]"
-                    f" (score: [green]{r.score:.4f}[/green])"
-                )
+                console.print(f"  [cyan]{r.uri}[/cyan] (score: [green]{r.score:.4f}[/green])")
         else:
             console.print("  [dim]No context search results[/dim]")
 
@@ -208,16 +224,24 @@ async def main():
         console.print()
 
         # ── Done ──
-        console.print(Panel(
-            "[bold green]All operations completed[/bold green]",
-            style="green", width=PANEL_WIDTH,
-        ))
+        console.print(
+            Panel(
+                "[bold green]All operations completed[/bold green]",
+                style="green",
+                width=PANEL_WIDTH,
+            )
+        )
 
     except Exception as e:
-        console.print(Panel(
-            f"[bold red]Error:[/bold red] {e}", style="red", width=PANEL_WIDTH,
-        ))
+        console.print(
+            Panel(
+                f"[bold red]Error:[/bold red] {e}",
+                style="red",
+                width=PANEL_WIDTH,
+            )
+        )
         import traceback
+
         traceback.print_exc()
 
     finally:

@@ -6,16 +6,18 @@ Skill Processor for OpenViking.
 Handles skill parsing, LLM generation, and storage operations.
 """
 
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openviking.core.context import Context, ContextType, Vectorize
 from openviking.core.mcp_converter import is_mcp_format, mcp_to_skill
 from openviking.core.skill_loader import SkillLoader
+from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.viking_fs import VikingFS
-from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
@@ -42,7 +44,7 @@ class SkillProcessor:
         self,
         data: Any,
         viking_fs: VikingFS,
-        user: Optional[UserIdentifier] = None,
+        ctx: RequestContext,
     ) -> Dict[str, Any]:
         """
         Process and store a skill.
@@ -56,6 +58,9 @@ class SkillProcessor:
             Processing result with status and metadata
         """
 
+        if data is None:
+            raise ValueError("Skill data cannot be None")
+
         config = get_openviking_config()
 
         skill_dict, auxiliary_files, base_path = self._parse_skill(data)
@@ -66,6 +71,9 @@ class SkillProcessor:
             is_leaf=False,
             abstract=skill_dict.get("description", ""),
             context_type=ContextType.SKILL.value,
+            user=ctx.user,
+            account_id=ctx.account_id,
+            owner_space=ctx.user.agent_space_name(),
             meta={
                 "name": skill_dict["name"],
                 "description": skill_dict.get("description", ""),
@@ -85,6 +93,7 @@ class SkillProcessor:
             skill_dict=skill_dict,
             skill_dir_uri=skill_dir_uri,
             overview=overview,
+            ctx=ctx,
         )
 
         await self._write_auxiliary_files(
@@ -92,6 +101,7 @@ class SkillProcessor:
             auxiliary_files=auxiliary_files,
             base_path=base_path,
             skill_dir_uri=skill_dir_uri,
+            ctx=ctx,
         )
 
         await self._index_skill(
@@ -108,14 +118,22 @@ class SkillProcessor:
 
     def _parse_skill(self, data: Any) -> tuple[Dict[str, Any], List[Path], Optional[Path]]:
         """Parse skill data from various formats."""
+        if data is None:
+            raise ValueError("Skill data cannot be None")
+
         auxiliary_files = []
         base_path = None
 
-        # Convert string paths to Path objects
         if isinstance(data, str):
             path_obj = Path(data)
             if path_obj.exists():
-                data = path_obj
+                if zipfile.is_zipfile(path_obj):
+                    temp_dir = Path(tempfile.mkdtemp())
+                    with zipfile.ZipFile(path_obj, "r") as zipf:
+                        zipf.extractall(temp_dir)
+                    data = temp_dir
+                else:
+                    data = path_obj
 
         if isinstance(data, Path):
             if data.is_dir():
@@ -165,6 +183,7 @@ class SkillProcessor:
         skill_dict: Dict[str, Any],
         skill_dir_uri: str,
         overview: str,
+        ctx: RequestContext,
     ):
         """Write main skill content to VikingFS."""
         await viking_fs.write_context(
@@ -174,6 +193,7 @@ class SkillProcessor:
             overview=overview,
             content_filename="SKILL.md",
             is_leaf=False,
+            ctx=ctx,
         )
 
     async def _write_auxiliary_files(
@@ -182,6 +202,7 @@ class SkillProcessor:
         auxiliary_files: List[Path],
         base_path: Optional[Path],
         skill_dir_uri: str,
+        ctx: RequestContext,
     ):
         """Write auxiliary files to VikingFS."""
         for aux_file in auxiliary_files:
@@ -199,13 +220,18 @@ class SkillProcessor:
                 is_text = False
 
             if is_text:
-                await viking_fs.write_file(aux_uri, file_bytes.decode("utf-8"))
+                await viking_fs.write_file(aux_uri, file_bytes.decode("utf-8"), ctx=ctx)
             else:
-                await viking_fs.write_file_bytes(aux_uri, file_bytes)
+                await viking_fs.write_file_bytes(aux_uri, file_bytes, ctx=ctx)
 
     async def _index_skill(self, context: Context, skill_dir_uri: str):
-        """Write skill to vector store via async queue."""
+        """Write skill directory vector via async queue as L0."""
         context.uri = skill_dir_uri
+        context.parent_uri = "viking://agent/skills"
+        context.is_leaf = False
+        context.level = 0
 
+        context.set_vectorize(Vectorize(text=context.abstract))
         embedding_msg = EmbeddingMsgConverter.from_context(context)
-        await self.vikingdb.enqueue_embedding_msg(embedding_msg)
+        if embedding_msg:
+            await self.vikingdb.enqueue_embedding_msg(embedding_msg)

@@ -3,6 +3,8 @@ mod commands;
 mod config;
 mod error;
 mod output;
+mod tui;
+mod utils;
 
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -28,7 +30,12 @@ impl CliContext {
     }
 
     pub fn get_client(&self) -> client::HttpClient {
-        client::HttpClient::new(&self.config.url, self.config.api_key.clone())
+        client::HttpClient::new(
+            &self.config.url,
+            self.config.api_key.clone(),
+            self.config.agent_id.clone(),
+            self.config.timeout,
+        )
     }
 }
 
@@ -68,9 +75,24 @@ enum Commands {
         /// Wait until processing is complete
         #[arg(long)]
         wait: bool,
-        /// Wait timeout in seconds
+        /// Wait timeout in seconds (only used with --wait)
         #[arg(long)]
         timeout: Option<f64>,
+        /// No strict mode for directory scanning
+        #[arg(long = "no-strict", default_value_t = false)]
+        no_strict: bool,
+        /// Ignore directories, e.g. --ignore-dirs "node_modules,dist"
+        #[arg(long)]
+        ignore_dirs: Option<String>,
+        /// Include files extensions, e.g. --include "*.pdf,*.md"
+        #[arg(long)]
+        include: Option<String>,
+        /// Exclude files extensions, e.g. --exclude "*.tmp,*.log"
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Do not directly upload media files
+        #[arg(long = "no-directly-upload-media", default_value_t = false)]
+        no_directly_upload_media: bool,
     },
     /// Add a skill into OpenViking
     AddSkill {
@@ -150,6 +172,11 @@ enum Commands {
         #[command(subcommand)]
         action: SessionCommands,
     },
+    /// Account and user management commands (multi-tenant)
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommands,
+    },
     /// List directory contents
     #[command(alias = "list")]
     Ls {
@@ -169,7 +196,7 @@ enum Commands {
         #[arg(short, long)]
         all: bool,
         /// Maximum number of nodes to list
-        #[arg(long = "node-limit", short = 'n', default_value = "1000")]
+        #[arg(long = "node-limit", short = 'n', alias = "limit", default_value = "256")]
         node_limit: i32,
     },
     /// Get directory tree
@@ -183,8 +210,11 @@ enum Commands {
         #[arg(short, long)]
         all: bool,
         /// Maximum number of nodes to list
-        #[arg(long = "node-limit", short = 'n', default_value = "1000")]
+        #[arg(long = "node-limit", short = 'n', alias = "limit", default_value = "256")]
         node_limit: i32,
+        /// Maximum depth level to traverse (default: 3)
+        #[arg(short = 'L', long = "level-limit", default_value = "3")]
+        level_limit: i32,
     },
     /// Create directory
     Mkdir {
@@ -236,8 +266,8 @@ enum Commands {
         #[arg(short, long, default_value = "")]
         uri: String,
         /// Maximum number of results
-        #[arg(short = 'n', long, default_value = "10")]
-        limit: i32,
+        #[arg(short = 'n', long = "node-limit", alias = "limit", default_value = "10")]
+        node_limit: i32,
         /// Score threshold
         #[arg(short, long)]
         threshold: Option<f64>,
@@ -253,8 +283,8 @@ enum Commands {
         #[arg(long)]
         session_id: Option<String>,
         /// Maximum number of results
-        #[arg(short = 'n', long, default_value = "10")]
-        limit: i32,
+        #[arg(short = 'n', long = "node-limit", alias = "limit", default_value = "10")]
+        node_limit: i32,
         /// Score threshold
         #[arg(short, long)]
         threshold: Option<f64>,
@@ -269,6 +299,9 @@ enum Commands {
         /// Case insensitive
         #[arg(short, long)]
         ignore_case: bool,
+        /// Maximum number of results
+        #[arg(short = 'n', long = "node-limit", alias = "limit", default_value = "256")]
+        node_limit: i32,
     },
     /// Run file glob pattern search
     Glob {
@@ -277,6 +310,9 @@ enum Commands {
         /// Search root URI
         #[arg(short, long, default_value = "viking://")]
         uri: String,
+        /// Maximum number of results
+        #[arg(short = 'n', long = "node-limit", alias = "limit", default_value = "256")]
+        node_limit: i32,
     },
     /// Add memory in one shot (creates session, adds messages, commits)
     AddMemory {
@@ -284,6 +320,27 @@ enum Commands {
         /// JSON {"role":"...","content":"..."} for a single message,
         /// or JSON array of such objects for multiple messages.
         content: String,
+    },
+    /// Interactive TUI file explorer
+    Tui {
+        /// Viking URI to start browsing (default: viking://)
+        #[arg(default_value = "viking://")]
+        uri: String,
+    },
+    /// Chat with vikingbot agent
+    Chat {
+        /// Message to send to the agent
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Session ID (defaults to machine unique ID)
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Disable rich formatting / markdown rendering
+        #[arg(long)]
+        no_format: bool,
+        /// Disable command history
+        #[arg(long)]
+        no_history: bool,
     },
     /// Configuration management
     Config {
@@ -355,6 +412,63 @@ enum SessionCommands {
 }
 
 #[derive(Subcommand)]
+enum AdminCommands {
+    /// Create a new account with its first admin user
+    CreateAccount {
+        /// Account ID to create
+        account_id: String,
+        /// First admin user ID
+        #[arg(long = "admin")]
+        admin_user_id: String,
+    },
+    /// List all accounts (ROOT only)
+    ListAccounts,
+    /// Delete an account and all associated users (ROOT only)
+    DeleteAccount {
+        /// Account ID to delete
+        account_id: String,
+    },
+    /// Register a new user in an account
+    RegisterUser {
+        /// Account ID
+        account_id: String,
+        /// User ID to register
+        user_id: String,
+        /// Role: admin or user
+        #[arg(long, default_value = "user")]
+        role: String,
+    },
+    /// List all users in an account
+    ListUsers {
+        /// Account ID
+        account_id: String,
+    },
+    /// Remove a user from an account
+    RemoveUser {
+        /// Account ID
+        account_id: String,
+        /// User ID to remove
+        user_id: String,
+    },
+    /// Change a user's role (ROOT only)
+    SetRole {
+        /// Account ID
+        account_id: String,
+        /// User ID
+        user_id: String,
+        /// New role: admin or user
+        role: String,
+    },
+    /// Regenerate a user's API key (old key immediately invalidated)
+    RegenerateKey {
+        /// Account ID
+        account_id: String,
+        /// User ID
+        user_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommands {
     /// Show current configuration
     Show,
@@ -365,7 +479,7 @@ enum ConfigCommands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    
+
     let output_format = cli.output;
     let compact = cli.compact;
 
@@ -378,8 +492,34 @@ async fn main() {
     };
 
     let result = match cli.command {
-        Commands::AddResource { path, to, reason, instruction, wait, timeout } => {
-            handle_add_resource(path, to, reason, instruction, wait, timeout, ctx).await
+        Commands::AddResource {
+            path,
+            to,
+            reason,
+            instruction,
+            wait,
+            timeout,
+            no_strict,
+            ignore_dirs,
+            include,
+            exclude,
+            no_directly_upload_media,
+        } => {
+            handle_add_resource(
+                path,
+                to,
+                reason,
+                instruction,
+                wait,
+                timeout,
+                no_strict,
+                ignore_dirs,
+                include,
+                exclude,
+                no_directly_upload_media,
+                ctx,
+            )
+            .await
         }
         Commands::AddSkill { data, wait, timeout } => {
             handle_add_skill(data, wait, timeout, ctx).await
@@ -411,11 +551,12 @@ async fn main() {
         Commands::System { action } => handle_system(action, ctx).await,
         Commands::Observer { action } => handle_observer(action, ctx).await,
         Commands::Session { action } => handle_session(action, ctx).await,
+        Commands::Admin { action } => handle_admin(action, ctx).await,
         Commands::Ls { uri, simple, recursive, abs_limit, all, node_limit } => {
             handle_ls(uri, simple, recursive, abs_limit, all, node_limit, ctx).await
         }
-        Commands::Tree { uri, abs_limit, all, node_limit } => {
-            handle_tree(uri, abs_limit, all, node_limit, ctx).await
+        Commands::Tree { uri, abs_limit, all, node_limit, level_limit } => {
+            handle_tree(uri, abs_limit, all, node_limit, level_limit, ctx).await
         }
         Commands::Mkdir { uri } => {
             handle_mkdir(uri, ctx).await
@@ -432,6 +573,23 @@ async fn main() {
         Commands::AddMemory { content } => {
             handle_add_memory(content, ctx).await
         }
+        Commands::Tui { uri } => {
+            handle_tui(uri, ctx).await
+        }
+        Commands::Chat { message, session, no_format, no_history } => {
+            let session_id = session.or_else(|| config::get_or_create_machine_id().ok());
+            let cmd = commands::chat::ChatCommand {
+                endpoint: std::env::var("VIKINGBOT_ENDPOINT").unwrap_or_else(|_| "http://localhost:1933/bot/v1".to_string()),
+                api_key: std::env::var("VIKINGBOT_API_KEY").ok(),
+                session: session_id,
+                user: "cli_user".to_string(),
+                message,
+                stream: false,
+                no_format,
+                no_history,
+            };
+            cmd.run().await
+        }
         Commands::Config { action } => handle_config(action, ctx).await,
         Commands::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -440,17 +598,18 @@ async fn main() {
         Commands::Read { uri } => handle_read(uri, ctx).await,
         Commands::Abstract { uri } => handle_abstract(uri, ctx).await,
         Commands::Overview { uri } => handle_overview(uri, ctx).await,
-        Commands::Find { query, uri, limit, threshold } => {
-            handle_find(query, uri, limit, threshold, ctx).await
+        Commands::Find { query, uri, node_limit, threshold } => {
+            handle_find(query, uri, node_limit, threshold, ctx).await
         }
-        Commands::Search { query, uri, session_id, limit, threshold } => {
-            handle_search(query, uri, session_id, limit, threshold, ctx).await
+        Commands::Search { query, uri, session_id, node_limit, threshold } => {
+            handle_search(query, uri, session_id, node_limit, threshold, ctx).await
         }
-        Commands::Grep { uri, pattern, ignore_case } => {
-            handle_grep(uri, pattern, ignore_case, ctx).await
+        Commands::Grep { uri, pattern, ignore_case, node_limit } => {
+            handle_grep(uri, pattern, ignore_case, node_limit, ctx).await
         }
-        Commands::Glob { pattern, uri } => {
-            handle_glob(pattern, uri, ctx).await
+
+        Commands::Glob { pattern, uri, node_limit } => {
+            handle_glob(pattern, uri, node_limit, ctx).await
         }
     };
 
@@ -461,17 +620,69 @@ async fn main() {
 }
 
 async fn handle_add_resource(
-    path: String,
+    mut path: String,
     to: Option<String>,
     reason: String,
     instruction: String,
     wait: bool,
     timeout: Option<f64>,
+    no_strict: bool,
+    ignore_dirs: Option<String>,
+    include: Option<String>,
+    exclude: Option<String>,
+    no_directly_upload_media: bool,
     ctx: CliContext,
 ) -> Result<()> {
+    let is_url = path.starts_with("http://") 
+        || path.starts_with("https://")
+        || path.starts_with("git@");
+    
+    if !is_url {
+        use std::path::Path;
+        
+        // Unescape path: replace backslash followed by space with just space
+        let unescaped_path = path.replace("\\ ", " ");
+        let path_obj = Path::new(&unescaped_path);
+        if !path_obj.exists() {
+            eprintln!("Error: Path '{}' does not exist.", path);
+            
+            // Check if there might be unquoted spaces
+            use std::env;
+            let args: Vec<String> = env::args().collect();
+            
+            if let Some(add_resource_pos) = args.iter().position(|s| s == "add-resource" || s == "add") {
+                if args.len() > add_resource_pos + 2 {
+                    let extra_args = &args[add_resource_pos + 2..];
+                    let suggested_path = format!("{} {}", path, extra_args.join(" "));
+                    eprintln!("\nIt looks like you may have forgotten to quote a path with spaces.");
+                    eprintln!("Suggested command: ov add-resource \"{}\"", suggested_path);
+                }
+            }
+            
+            std::process::exit(1);
+        }
+        path = unescaped_path;
+    }
+    
+    let strict = !no_strict;
+    let directly_upload_media = !no_directly_upload_media;
+
     let client = ctx.get_client();
     commands::resources::add_resource(
-        &client, &path, to, reason, instruction, wait, timeout, ctx.output_format, ctx.compact
+        &client,
+        &path,
+        to,
+        reason,
+        instruction,
+        wait,
+        timeout,
+        strict,
+        ignore_dirs,
+        include,
+        exclude,
+        directly_upload_media,
+        ctx.output_format,
+        ctx.compact,
     ).await
 }
 
@@ -597,6 +808,50 @@ async fn handle_session(cmd: SessionCommands, ctx: CliContext) -> Result<()> {
     }
 }
 
+async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
+    let client = ctx.get_client();
+    match cmd {
+        AdminCommands::CreateAccount { account_id, admin_user_id } => {
+            commands::admin::create_account(
+                &client, &account_id, &admin_user_id, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::ListAccounts => {
+            commands::admin::list_accounts(&client, ctx.output_format, ctx.compact).await
+        }
+        AdminCommands::DeleteAccount { account_id } => {
+            commands::admin::delete_account(
+                &client, &account_id, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::RegisterUser { account_id, user_id, role } => {
+            commands::admin::register_user(
+                &client, &account_id, &user_id, &role, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::ListUsers { account_id } => {
+            commands::admin::list_users(
+                &client, &account_id, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::RemoveUser { account_id, user_id } => {
+            commands::admin::remove_user(
+                &client, &account_id, &user_id, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::SetRole { account_id, user_id, role } => {
+            commands::admin::set_role(
+                &client, &account_id, &user_id, &role, ctx.output_format, ctx.compact,
+            ).await
+        }
+        AdminCommands::RegenerateKey { account_id, user_id } => {
+            commands::admin::regenerate_key(
+                &client, &account_id, &user_id, ctx.output_format, ctx.compact,
+            ).await
+        }
+    }
+}
+
 async fn handle_add_memory(content: String, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
     commands::session::add_memory(&client, &content, ctx.output_format, ctx.compact).await
@@ -645,36 +900,77 @@ async fn handle_overview(uri: String, ctx: CliContext) -> Result<()> {
 async fn handle_find(
     query: String,
     uri: String,
-    limit: i32,
+    node_limit: i32,
     threshold: Option<f64>,
     ctx: CliContext,
 ) -> Result<()> {
+    let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
+    if let Some(t) = threshold {
+        params.push(format!("--threshold {}", t));
+    }
+    params.push(format!("\"{}\"", query));
+    print_command_echo("ov find", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
-    commands::search::find(&client, &query, &uri, limit, threshold, ctx.output_format, ctx.compact).await
+    commands::search::find(&client, &query, &uri, node_limit, threshold, ctx.output_format, ctx.compact).await
 }
 
 async fn handle_search(
     query: String,
     uri: String,
     session_id: Option<String>,
-    limit: i32,
+    node_limit: i32,
     threshold: Option<f64>,
     ctx: CliContext,
 ) -> Result<()> {
+    let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
+    if let Some(s) = &session_id {
+        params.push(format!("--session-id {}", s));
+    }
+    if let Some(t) = threshold {
+        params.push(format!("--threshold {}", t));
+    }
+    params.push(format!("\"{}\"", query));
+    print_command_echo("ov search", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
-    commands::search::search(&client, &query, &uri, session_id, limit, threshold, ctx.output_format, ctx.compact).await
+    commands::search::search(&client, &query, &uri, session_id, node_limit, threshold, ctx.output_format, ctx.compact).await
+}
+
+/// Print command with specified parameters for debugging
+fn print_command_echo(command: &str, params: &str, echo_enabled: bool) {
+    if echo_enabled {
+        println!("cmd: {} {}", command, params);
+    }
 }
 
 async fn handle_ls(uri: String, simple: bool, recursive: bool, abs_limit: i32, show_all_hidden: bool, node_limit: i32, ctx: CliContext) -> Result<()> {
+    let mut params = vec![
+        uri.clone(),
+        format!("-l {}", abs_limit),
+        format!("-n {}", node_limit),
+    ];
+    if simple { params.push("-s".to_string()); }
+    if recursive { params.push("-r".to_string()); }
+    if show_all_hidden { params.push("-a".to_string()); }
+    print_command_echo("ov ls", &params.join(" "), ctx.config.echo_command);
+
     let client = ctx.get_client();
     let api_output = if ctx.compact { "agent" } else { "original" };
     commands::filesystem::ls(&client, &uri, simple, recursive, api_output, abs_limit, show_all_hidden, node_limit, ctx.output_format, ctx.compact).await
 }
 
-async fn handle_tree(uri: String, abs_limit: i32, show_all_hidden: bool, node_limit: i32, ctx: CliContext) -> Result<()> {
+async fn handle_tree(uri: String, abs_limit: i32, show_all_hidden: bool, node_limit: i32, level_limit: i32, ctx: CliContext) -> Result<()> {
+    let mut params = vec![
+        uri.clone(),
+        format!("-l {}", abs_limit),
+        format!("-n {}", node_limit),
+        format!("-L {}", level_limit),
+    ];
+    if show_all_hidden { params.push("-a".to_string()); }
+    print_command_echo("ov tree", &params.join(" "), ctx.config.echo_command);
+
     let client = ctx.get_client();
     let api_output = if ctx.compact { "agent" } else { "original" };
-    commands::filesystem::tree(&client, &uri, api_output, abs_limit, show_all_hidden, node_limit, ctx.output_format, ctx.compact).await
+    commands::filesystem::tree(&client, &uri, api_output, abs_limit, show_all_hidden, node_limit, level_limit, ctx.output_format, ctx.compact).await
 }
 
 async fn handle_mkdir(uri: String, ctx: CliContext) -> Result<()> {
@@ -697,14 +993,21 @@ async fn handle_stat(uri: String, ctx: CliContext) -> Result<()> {
     commands::filesystem::stat(&client, &uri, ctx.output_format, ctx.compact).await
 }
 
-async fn handle_grep(uri: String, pattern: String, ignore_case: bool, ctx: CliContext) -> Result<()> {
+async fn handle_grep(uri: String, pattern: String, ignore_case: bool, node_limit: i32, ctx: CliContext) -> Result<()> {
+    let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
+    if ignore_case { params.push("-i".to_string()); }
+    params.push(format!("\"{}\"", pattern));
+    print_command_echo("ov grep", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
-    commands::search::grep(&client, &uri, &pattern, ignore_case, ctx.output_format, ctx.compact).await
+    commands::search::grep(&client, &uri, &pattern, ignore_case, node_limit, ctx.output_format, ctx.compact).await
 }
 
-async fn handle_glob(pattern: String, uri: String, ctx: CliContext) -> Result<()> {
+
+async fn handle_glob(pattern: String, uri: String, node_limit: i32, ctx: CliContext) -> Result<()> {
+    let params = vec![format!("--uri={}", uri), format!("-n {}", node_limit), format!("\"{}\"", pattern)];
+    print_command_echo("ov glob", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
-    commands::search::glob(&client, &pattern, &uri, ctx.output_format, ctx.compact).await
+    commands::search::glob(&client, &pattern, &uri, node_limit, ctx.output_format, ctx.compact).await
 }
 
 async fn handle_health(ctx: CliContext) -> Result<()> {
@@ -716,4 +1019,9 @@ async fn handle_health(ctx: CliContext) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+async fn handle_tui(uri: String, ctx: CliContext) -> Result<()> {
+    let client = ctx.get_client();
+    tui::run_tui(client, &uri).await
 }

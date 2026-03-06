@@ -20,11 +20,17 @@ IMPORTANT (v5.0 Architecture):
 - Content splitting is handled by Parser, not TreeBuilder
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Optional
 
 from openviking.core.building_tree import BuildingTree
+from openviking.core.context import Context
+from openviking.parse.parsers.media.utils import get_media_base_uri, get_media_type
+from openviking.server.identity import RequestContext
+from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils import parse_code_hosting_url
 from openviking_cli.utils.uri import VikingURI
 
 if TYPE_CHECKING:
@@ -58,10 +64,15 @@ class TreeBuilder:
         """Initialize TreeBuilder."""
         pass
 
-    def _get_base_uri(self, scope: str) -> str:
-        """Get base URI for scope."""
-        # Resources are now in independent resources scope
+    def _get_base_uri(
+        self, scope: str, source_path: Optional[str] = None, source_format: Optional[str] = None
+    ) -> str:
+        """Get base URI for scope, with special handling for media files."""
+        # Check if it's a media file first
         if scope == "resources":
+            media_type = get_media_type(source_path, source_format)
+            if media_type:
+                return get_media_base_uri(media_type)
             return "viking://resources"
         if scope == "user":
             # user resources go to memories (no separate resources dir)
@@ -76,73 +87,102 @@ class TreeBuilder:
     async def finalize_from_temp(
         self,
         temp_dir_path: str,
-        scope: str,
+        ctx: RequestContext,
+        scope: str = "resources",
         base_uri: Optional[str] = None,
         source_path: Optional[str] = None,
         source_format: Optional[str] = None,
+        trigger_semantic: bool = False,
     ) -> "BuildingTree":
         """
-        Finalize tree from temporary directory (v5.0 architecture).
-
-        New architecture:
-        1. Move directory to AGFS
-        2. Enqueue to SemanticQueue for async semantic generation
-        3. Scan and create Resource objects (for compatibility)
+        Finalize processing by moving from temp to AGFS.
 
         Args:
-            temp_dir_path: Temporary directory Viking URI (e.g., viking://temp/xxx)
-            scope: Scope ("resources", "user", or "agent")
-            base_uri: Base URI (None = use scope default)
-            source_path: Source file path
-            source_format: Source file format
-
-        Returns:
-            Complete BuildingTree with all resources moved to AGFS
+            trigger_semantic: Whether to automatically trigger semantic generation.
+                              Default is False (handled by ResourceProcessor/Summarizer).
         """
 
         viking_fs = get_viking_fs()
         temp_uri = temp_dir_path
 
         # 1. Find document root directory
-        entries = await viking_fs.ls(temp_uri)
+        entries = await viking_fs.ls(temp_uri, ctx=ctx)
         doc_dirs = [e for e in entries if e.get("isDir") and e["name"] not in [".", ".."]]
 
         if len(doc_dirs) != 1:
-            raise ValueError(f"Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}")
+            logger.error(
+                f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
+            )
+            raise ValueError(
+                f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
+            )
 
-        doc_name = doc_dirs[0]["name"]
-        doc_uri = f"{temp_uri}/{doc_name}"
+        original_name = doc_dirs[0]["name"]
+        doc_name = VikingURI.sanitize_segment(original_name)
+        temp_doc_uri = f"{temp_uri}/{original_name}"  # use original name to find temp dir
+        if original_name != doc_name:
+            logger.debug(f"[TreeBuilder] Sanitized doc name: {original_name!r} -> {doc_name!r}")
 
-        # 2. Determine base_uri
-        if base_uri is None:
-            base_uri = self._get_base_uri(scope)
+        # Check if source_path is a GitHub/GitLab URL and extract org/repo
+        final_doc_name = doc_name
+        if source_path and source_format == "repository":
+            parsed_org_repo = parse_code_hosting_url(source_path)
+            if parsed_org_repo:
+                final_doc_name = parsed_org_repo
 
-        logger.info(f"Finalizing from temp: {temp_uri} -> {base_uri}")
+        # 2. Determine base_uri and final document name with org/repo for GitHub/GitLab
+        auto_base_uri = self._get_base_uri(scope, source_path, source_format)
 
-        # 3. Build final URI, auto-renaming on conflict (e.g. doc_1, doc_2, ...)
-        candidate_uri = VikingURI(base_uri).join(doc_name).uri
-        final_uri = await self._resolve_unique_uri(candidate_uri)
+        # 3. Check if base_uri exists - if it does, use it as parent directory
+        base_exists = False
+        if base_uri:
+            try:
+                await viking_fs.stat(base_uri)
+                base_exists = True
+            except Exception:
+                base_exists = False
+
+        if base_exists:
+            if "/" in final_doc_name:
+                repo_name_only = final_doc_name.split("/")[-1]
+            else:
+                repo_name_only = final_doc_name
+            candidate_uri = VikingURI(base_uri or auto_base_uri).join(repo_name_only).uri
+        else:
+            if "/" in final_doc_name:
+                parts = final_doc_name.split("/")
+                sanitized_parts = [VikingURI.sanitize_segment(p) for p in parts if p]
+                base_viking_uri = VikingURI(base_uri or auto_base_uri)
+                candidate_uri = VikingURI.build(base_viking_uri.scope, *sanitized_parts)
+            else:
+                candidate_uri = VikingURI(base_uri or auto_base_uri).join(doc_name).uri
+        final_uri = await self._resolve_unique_uri(candidate_uri, ctx=ctx)
+
         if final_uri != candidate_uri:
-            logger.info(f"Resolved name conflict: {candidate_uri} -> {final_uri}")
+            logger.info(f"[TreeBuilder] Resolved name conflict: {candidate_uri} -> {final_uri}")
+        else:
+            logger.info(f"[TreeBuilder] Finalizing from temp: {final_uri}")
 
         # 4. Move directory tree from temp to final location in AGFS
-        await self._move_directory_in_agfs(doc_uri, final_uri)
-        logger.info(f"Moved temp tree: {doc_uri} -> {final_uri}")
+        await self._move_temp_to_dest(viking_fs, temp_doc_uri, final_uri, ctx=ctx)
+        logger.info(f"[TreeBuilder] Moved temp tree: {temp_doc_uri} -> {final_uri}")
 
         # 5. Cleanup temporary root directory
         try:
-            await viking_fs.delete_temp(temp_uri)
-            logger.info(f"Cleaned up temp root: {temp_uri}")
+            await viking_fs.delete_temp(temp_uri, ctx=ctx)
+            logger.info(f"[TreeBuilder] Cleaned up temp root: {temp_uri}")
         except Exception as e:
-            logger.warning(f"Failed to cleanup temp root: {e}")
+            logger.warning(f"[TreeBuilder] Failed to cleanup temp root: {e}")
 
         # 6. Enqueue to SemanticQueue for async semantic generation
-        try:
-            context_type = "resource"  # Default to resource
-            await self._enqueue_semantic_generation(final_uri, context_type)
-            logger.info(f"Enqueued semantic generation for: {final_uri}")
-        except Exception as e:
-            logger.error(f"Failed to enqueue semantic generation: {e}", exc_info=True)
+        if trigger_semantic:
+            try:
+                await self._enqueue_semantic_generation(final_uri, "resource", ctx=ctx)
+                logger.info(f"[TreeBuilder] Enqueued semantic generation for: {final_uri}")
+            except Exception as e:
+                logger.error(
+                    f"[TreeBuilder] Failed to enqueue semantic generation: {e}", exc_info=True
+                )
 
         # 7. Return simple BuildingTree (no scanning needed)
         tree = BuildingTree(
@@ -151,11 +191,15 @@ class TreeBuilder:
         )
         tree._root_uri = final_uri
 
-        logger.info(f"Finalized tree: root_uri={final_uri}")
+        # Create a minimal Context object for the root so that tree.root is not None
+        root_context = Context(uri=final_uri)
+        tree.add_context(root_context)
 
         return tree
 
-    async def _resolve_unique_uri(self, uri: str, max_attempts: int = 100) -> str:
+    async def _resolve_unique_uri(
+        self, uri: str, max_attempts: int = 100, ctx: Optional[RequestContext] = None
+    ) -> str:
         """Return a URI that does not collide with an existing resource.
 
         If *uri* is free, return it unchanged.  Otherwise append ``_1``,
@@ -166,7 +210,7 @@ class TreeBuilder:
 
         async def _exists(u: str) -> bool:
             try:
-                await viking_fs.stat(u)
+                await viking_fs.stat(u, ctx=ctx)
                 return True
             except Exception:
                 return False
@@ -179,45 +223,21 @@ class TreeBuilder:
             if not await _exists(candidate):
                 return candidate
 
-        raise FileExistsError(
-            f"Cannot resolve unique name for {uri} after {max_attempts} attempts"
-        )
+        raise FileExistsError(f"Cannot resolve unique name for {uri} after {max_attempts} attempts")
 
-    async def _move_directory_in_agfs(self, src_uri: str, dst_uri: str) -> None:
-        """Recursively move AGFS directory tree (copy + delete)."""
-        viking_fs = get_viking_fs()
+    async def _move_temp_to_dest(
+        self, viking_fs, src_uri: str, dst_uri: str, ctx: RequestContext
+    ) -> None:
+        """Move temp directory to final destination using a single native AGFS mv call.
 
-        # 1. Ensure parent directories exist
-        await self._ensure_parent_dirs(dst_uri)
+        Temp files have no vector records yet, so no vector index update is needed.
+        """
+        src_path = viking_fs._uri_to_path(src_uri, ctx=ctx)
+        dst_path = viking_fs._uri_to_path(dst_uri, ctx=ctx)
+        await self._ensure_parent_dirs(dst_uri, ctx=ctx)
+        await asyncio.to_thread(viking_fs.agfs.mv, src_path, dst_path)
 
-        # 2. Create target directory
-        await viking_fs.mkdir(dst_uri)
-
-        # 3. List source directory contents
-        entries = await viking_fs.ls(src_uri)
-
-        for entry in entries:
-            name = entry.get("name", "")
-            if not name or name in [".", ".."]:
-                continue
-
-            src_item = f"{src_uri}/{name}"
-            dst_item = f"{dst_uri}/{name}"
-
-            if entry.get("isDir"):
-                # Recursively move subdirectory
-                await self._move_directory_in_agfs(src_item, dst_item)
-            else:
-                # Move file
-                await viking_fs.move_file(src_item, dst_item)
-
-        # 4. Delete source directory (should be empty now)
-        try:
-            await viking_fs.rm(src_uri)
-        except Exception:
-            pass  # Ignore error when deleting empty directory
-
-    async def _ensure_parent_dirs(self, uri: str) -> None:
+    async def _ensure_parent_dirs(self, uri: str, ctx: RequestContext) -> None:
         """Recursively create parent directories."""
         viking_fs = get_viking_fs()
         parent = VikingURI(uri).parent
@@ -225,18 +245,20 @@ class TreeBuilder:
             return
         parent_uri = parent.uri
         # Recursively ensure parent's parent exists
-        await self._ensure_parent_dirs(parent_uri)
+        await self._ensure_parent_dirs(parent_uri, ctx=ctx)
 
         # Create parent directory (ignore if already exists)
         try:
-            await viking_fs.mkdir(parent_uri)
+            await viking_fs.mkdir(parent_uri, exist_ok=True, ctx=ctx)
             logger.debug(f"Created parent directory: {parent_uri}")
         except Exception as e:
             # Directory may already exist, ignore error
             if "exist" not in str(e).lower():
                 logger.debug(f"Parent dir {parent_uri} may already exist: {e}")
 
-    async def _enqueue_semantic_generation(self, uri: str, context_type: str) -> None:
+    async def _enqueue_semantic_generation(
+        self, uri: str, context_type: str, ctx: RequestContext
+    ) -> None:
         """
         Enqueue a directory for semantic generation.
 
@@ -244,7 +266,6 @@ class TreeBuilder:
             uri: Directory URI to enqueue
             context_type: resource/memory/skill
         """
-        from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 
         queue_manager = get_queue_manager()
 
@@ -255,6 +276,10 @@ class TreeBuilder:
         msg = SemanticMsg(
             uri=uri,
             context_type=context_type,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            agent_id=ctx.user.agent_id,
+            role=ctx.role.value,
         )
         await semantic_queue.enqueue(msg)
 

@@ -5,7 +5,6 @@
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
-from openviking.core.context import Context, ResourceContentType, Vectorize
 from openviking.parse.parsers.constants import (
     CODE_EXTENSIONS,
     DOCUMENTATION_EXTENSIONS,
@@ -13,11 +12,19 @@ from openviking.parse.parsers.constants import (
     FILE_TYPE_DOCUMENTATION,
     FILE_TYPE_OTHER,
 )
+from openviking.parse.parsers.media.utils import (
+    generate_audio_summary,
+    generate_image_summary,
+    generate_video_summary,
+    get_media_type,
+)
 from openviking.prompts import render_prompt
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.viking_fs import get_viking_fs
+from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
@@ -45,6 +52,31 @@ class SemanticProcessor(DequeueHandlerBase):
         """
         self.max_concurrent_llm = max_concurrent_llm
         self._dag_executor: Optional[SemanticDagExecutor] = None
+        self._current_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+        self._current_msg: Optional[SemanticMsg] = None
+
+    @staticmethod
+    def _owner_space_for_uri(uri: str, ctx: RequestContext) -> str:
+        """Derive owner_space from a URI.
+
+        Resources (viking://resources/...) always get owner_space="" so they
+        are globally visible.  User / agent / session URIs inherit the
+        caller's space name.
+        """
+        if uri.startswith("viking://agent/"):
+            return ctx.user.agent_space_name()
+        if uri.startswith("viking://user/") or uri.startswith("viking://session/"):
+            return ctx.user.user_space_name()
+        # resources and anything else → shared (empty owner_space)
+        return ""
+
+    @staticmethod
+    def _ctx_from_semantic_msg(msg: SemanticMsg) -> RequestContext:
+        role = Role(msg.role) if msg.role in {r.value for r in Role} else Role.ROOT
+        return RequestContext(
+            user=UserIdentifier(msg.account_id, msg.user_id, msg.agent_id),
+            role=role,
+        )
 
     def _detect_file_type(self, file_name: str) -> str:
         """
@@ -91,7 +123,7 @@ class SemanticProcessor(DequeueHandlerBase):
         viking_fs = get_viking_fs()
 
         try:
-            entries = await viking_fs.ls(uri)
+            entries = await viking_fs.ls(uri, ctx=self._current_ctx)
         except Exception as e:
             logger.warning(f"Failed to list directory {uri}: {e}")
             return
@@ -132,6 +164,8 @@ class SemanticProcessor(DequeueHandlerBase):
             # data is guaranteed to be not None at this point
             assert data is not None
             msg = SemanticMsg.from_dict(data)
+            self._current_msg = msg
+            self._current_ctx = self._ctx_from_semantic_msg(msg)
             logger.info(
                 f"Processing semantic generation for: {msg.uri} (recursive={msg.recursive})"
             )
@@ -141,6 +175,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     processor=self,
                     context_type=msg.context_type,
                     max_concurrent_llm=self.max_concurrent_llm,
+                    ctx=self._current_ctx,
                 )
                 self._dag_executor = executor
                 await executor.run(msg.uri)
@@ -155,7 +190,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 # Collect immediate children info only (no recursion)
                 viking_fs = get_viking_fs()
                 try:
-                    entries = await viking_fs.ls(msg.uri)
+                    entries = await viking_fs.ls(msg.uri, ctx=self._current_ctx)
                     for entry in entries:
                         name = entry.get("name", "")
                         if not name or name.startswith(".") or name in [".", ".."]:
@@ -186,6 +221,8 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.error(f"Failed to process semantic message: {e}", exc_info=True)
             self.report_error(str(e), data)
             return None
+        finally:
+            self._current_msg = None
 
     def get_dag_stats(self) -> Optional["DagStats"]:
         if not self._dag_executor:
@@ -217,8 +254,8 @@ class SemanticProcessor(DequeueHandlerBase):
         abstract = self._extract_abstract_from_overview(overview)
 
         # 5. Write files
-        await viking_fs.write_file(f"{uri}/.overview.md", overview)
-        await viking_fs.write_file(f"{uri}/.abstract.md", abstract)
+        await viking_fs.write_file(f"{uri}/.overview.md", overview, ctx=self._current_ctx)
+        await viking_fs.write_file(f"{uri}/.abstract.md", abstract, ctx=self._current_ctx)
 
         logger.debug(f"Generated overview and abstract for {uri}")
 
@@ -234,7 +271,7 @@ class SemanticProcessor(DequeueHandlerBase):
         results = []
 
         for child_uri in children_uris:
-            abstract = await viking_fs.abstract(child_uri)
+            abstract = await viking_fs.abstract(child_uri, ctx=self._current_ctx)
             dir_name = child_uri.split("/")[-1]
             results.append({"name": dir_name, "abstract": abstract})
         return results
@@ -250,11 +287,8 @@ class SemanticProcessor(DequeueHandlerBase):
         if not file_paths:
             return []
 
-        sem = asyncio.Semaphore(self.max_concurrent_llm)
-
         async def generate_one_summary(file_path: str) -> Dict[str, str]:
-            async with sem:
-                summary = await self._generate_single_file_summary(file_path)
+            summary = await self._generate_single_file_summary(file_path, ctx=self._current_ctx)
             if enqueue_files and context_type and parent_uri:
                 try:
                     await self._vectorize_single_file(
@@ -273,8 +307,97 @@ class SemanticProcessor(DequeueHandlerBase):
         tasks = [generate_one_summary(fp) for fp in file_paths]
         return await asyncio.gather(*tasks)
 
+    async def _generate_text_summary(
+        self,
+        file_path: str,
+        file_name: str,
+        llm_sem: asyncio.Semaphore,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, str]:
+        """Generate summary for a single text file (code, documentation, or other text)."""
+        viking_fs = get_viking_fs()
+        vlm = get_openviking_config().vlm
+        active_ctx = ctx or self._current_ctx
+
+        # Read file content (limit length)
+        content = await viking_fs.read_file(file_path, ctx=active_ctx)
+
+        # Limit content length (about 10000 tokens)
+        max_chars = 30000
+        content = await viking_fs.read_file(file_path, ctx=active_ctx)
+        if isinstance(content, bytes):
+            # Try to decode with error handling for text files
+            try:
+                content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.warning(f"Failed to decode file as UTF-8, skipping: {file_path}")
+                return {"name": file_name, "summary": ""}
+
+        # Limit content length (about 10000 tokens)
+        max_chars = 30000
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n...(truncated)"
+
+        # Generate summary
+        if not vlm.is_available():
+            logger.warning("VLM not available, using empty summary")
+            return {"name": file_name, "summary": ""}
+
+        # Detect file type and select appropriate prompt
+        file_type = self._detect_file_type(file_name)
+
+        if file_type == FILE_TYPE_CODE:
+            code_mode = get_openviking_config().code.code_summary_mode
+
+            if code_mode in ("ast", "ast_llm") and len(content.splitlines()) >= 100:
+                from openviking.parse.parsers.code.ast import extract_skeleton
+
+                verbose = code_mode == "ast_llm"
+                skeleton_text = extract_skeleton(file_name, content, verbose=verbose)
+                if skeleton_text:
+                    if code_mode == "ast":
+                        return {"name": file_name, "summary": skeleton_text}
+                    else:  # ast_llm
+                        prompt = render_prompt(
+                            "semantic.code_ast_summary",
+                            {"file_name": file_name, "skeleton": skeleton_text},
+                        )
+                        async with llm_sem:
+                            summary = await vlm.get_completion_async(prompt)
+                        return {"name": file_name, "summary": summary.strip()}
+                if skeleton_text is None:
+                    logger.info("AST unsupported language, fallback to LLM: %s", file_path)
+                else:
+                    logger.info("AST empty skeleton, fallback to LLM: %s", file_path)
+
+            # "llm" mode or fallback when skeleton is None/empty
+            prompt = render_prompt(
+                "semantic.code_summary",
+                {"file_name": file_name, "content": content},
+            )
+            async with llm_sem:
+                summary = await vlm.get_completion_async(prompt)
+            return {"name": file_name, "summary": summary.strip()}
+
+        elif file_type == FILE_TYPE_DOCUMENTATION:
+            prompt_id = "semantic.document_summary"
+        else:
+            prompt_id = "semantic.file_summary"
+
+        prompt = render_prompt(
+            prompt_id,
+            {"file_name": file_name, "content": content},
+        )
+
+        async with llm_sem:
+            summary = await vlm.get_completion_async(prompt)
+        return {"name": file_name, "summary": summary.strip()}
+
     async def _generate_single_file_summary(
-        self, file_path: str, llm_sem: Optional[asyncio.Semaphore] = None
+        self,
+        file_path: str,
+        llm_sem: Optional[asyncio.Semaphore] = None,
+        ctx: Optional[RequestContext] = None,
     ) -> Dict[str, str]:
         """Generate summary for a single file.
 
@@ -284,51 +407,17 @@ class SemanticProcessor(DequeueHandlerBase):
         Returns:
             {"name": file_name, "summary": summary_content}
         """
-        viking_fs = get_viking_fs()
-        vlm = get_openviking_config().vlm
         file_name = file_path.split("/")[-1]
-
-        try:
-            # Read file content (limit length)
-            content = await viking_fs.read_file(file_path)
-            if isinstance(content, bytes):
-                content = content.decode("utf-8")
-
-            # Limit content length (about 10000 tokens)
-            max_chars = 30000
-            if len(content) > max_chars:
-                content = content[:max_chars] + "\n...(truncated)"
-
-            # Generate summary
-            if not vlm.is_available():
-                logger.warning("VLM not available, using empty summary")
-                return {"name": file_name, "summary": ""}
-
-            # Detect file type and select appropriate prompt
-            file_type = self._detect_file_type(file_name)
-
-            if file_type == FILE_TYPE_CODE:
-                prompt_id = "semantic.code_summary"
-            elif file_type == FILE_TYPE_DOCUMENTATION:
-                prompt_id = "semantic.document_summary"
-            else:
-                prompt_id = "semantic.file_summary"
-
-            prompt = render_prompt(
-                prompt_id,
-                {"file_name": file_name, "content": content},
-            )
-
-            if llm_sem:
-                async with llm_sem:
-                    summary = await vlm.get_completion_async(prompt)
-            else:
-                summary = await vlm.get_completion_async(prompt)
-            return {"name": file_name, "summary": summary.strip()}
-
-        except Exception as e:
-            logger.warning(f"Failed to generate summary for {file_path}: {e}")
-            return {"name": file_name, "summary": ""}
+        llm_sem = llm_sem or asyncio.Semaphore(self.max_concurrent_llm)
+        media_type = get_media_type(file_name, None)
+        if media_type == "image":
+            return await generate_image_summary(file_path, file_name, llm_sem, ctx=ctx)
+        elif media_type == "audio":
+            return await generate_audio_summary(file_path, file_name, llm_sem, ctx=ctx)
+        elif media_type == "video":
+            return await generate_video_summary(file_path, file_name, llm_sem, ctx=ctx)
+        else:
+            return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
 
     def _extract_abstract_from_overview(self, overview_content: str) -> str:
         """Extract abstract from overview.md."""
@@ -419,28 +508,29 @@ class SemanticProcessor(DequeueHandlerBase):
             return f"# {dir_uri.split('/')[-1]}\n\nDirectory overview"
 
     async def _vectorize_directory_simple(
-        self, uri: str, context_type: str, abstract: str, overview: str
+        self,
+        uri: str,
+        context_type: str,
+        abstract: str,
+        overview: str,
+        ctx: Optional[RequestContext] = None,
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
-        from openviking.storage.queuefs import get_queue_manager
-        from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
+        if self._current_msg and getattr(self._current_msg, "skip_vectorization", False):
+            logger.info(f"Skipping vectorization for {uri} (requested via SemanticMsg)")
+            return
 
-        parent_uri = VikingURI(uri).parent.uri
-        context = Context(
+        from openviking.utils.embedding_utils import vectorize_directory_meta
+
+        active_ctx = ctx or self._current_ctx
+        await vectorize_directory_meta(
             uri=uri,
-            parent_uri=parent_uri,
-            is_leaf=False,
             abstract=abstract,
+            overview=overview,
             context_type=context_type,
+            ctx=active_ctx,
         )
-        context.set_vectorize(Vectorize(text=overview))
-
-        embedding_msg = EmbeddingMsgConverter.from_context(context)
-        queue_manager = get_queue_manager()
-        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
-        await embedding_queue.enqueue(embedding_msg)  # type: ignore
-        logger.debug(f"Enqueued directory for vectorization: {uri}")
 
     async def _vectorize_files(
         self,
@@ -448,6 +538,7 @@ class SemanticProcessor(DequeueHandlerBase):
         context_type: str,
         file_paths: List[str],
         file_summaries: List[Dict[str, str]],
+        ctx: Optional[RequestContext] = None,
     ) -> None:
         """Vectorize files in directory."""
         from openviking.storage.queuefs import get_queue_manager
@@ -462,6 +553,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_path=file_path,
                 summary_dict=file_summary_dict,
                 embedding_queue=embedding_queue,
+                ctx=ctx,
             )
 
     async def _vectorize_single_file(
@@ -471,70 +563,16 @@ class SemanticProcessor(DequeueHandlerBase):
         file_path: str,
         summary_dict: Dict[str, str],
         embedding_queue: Optional[Any] = None,
+        ctx: Optional[RequestContext] = None,
     ) -> None:
         """Vectorize a single file using its content or summary."""
-        from datetime import datetime
+        from openviking.utils.embedding_utils import vectorize_file
 
-        from openviking.storage.queuefs import get_queue_manager
-        from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
-
-        try:
-            file_name = summary_dict.get("name") or file_path.split("/")[-1]
-            summary = summary_dict.get("summary", "")
-
-            if embedding_queue is None:
-                queue_manager = get_queue_manager()
-                embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
-
-            context = Context(
-                uri=file_path,
-                parent_uri=parent_uri,
-                is_leaf=True,
-                abstract=summary,
-                context_type=context_type,
-                created_at=datetime.now(),
-            )
-
-            if self.get_resource_content_type(file_name) == ResourceContentType.TEXT:
-                content = await get_viking_fs().read_file(file_path)
-                context.set_vectorize(Vectorize(text=content))
-            elif summary:
-                context.set_vectorize(Vectorize(text=summary))
-            else:
-                return
-
-            embedding_msg = EmbeddingMsgConverter.from_context(context)
-            if not embedding_msg:
-                return
-            await embedding_queue.enqueue(embedding_msg)  # type: ignore
-            logger.debug(f"Enqueued file for vectorization: {file_path}")
-        except Exception as e:
-            logger.error(f"Failed to vectorize file {file_path}: {e}", exc_info=True)
-
-    def get_resource_content_type(self, file_name: str) -> ResourceContentType:
-        def _is_image_file(file_name: str) -> bool:
-            image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"}
-            return any(file_name.endswith(ext) for ext in image_extensions)
-
-        def _is_video_file(file_name: str) -> bool:
-            video_extensions = {".mp4", ".avi", ".mov", ".wmv", ".flv"}
-            return any(file_name.endswith(ext) for ext in video_extensions)
-
-        def _is_text_file(file_name: str) -> bool:
-            text_extensions = {".txt", ".md", ".csv", ".json", ".xml"}
-            return any(file_name.endswith(ext) for ext in text_extensions)
-
-        def _is_audio_file(file_name: str) -> bool:
-            audio_extensions = {".mp3", ".wav", ".aac", ".flac"}
-            return any(file_name.endswith(ext) for ext in audio_extensions)
-
-        if _is_text_file(file_name):
-            return ResourceContentType.TEXT
-        elif _is_image_file(file_name):
-            return ResourceContentType.IMAGE
-        elif _is_video_file(file_name):
-            return ResourceContentType.VIDEO
-        elif _is_audio_file(file_name):
-            return ResourceContentType.AUDIO
-
-        return ResourceContentType.BINARY
+        active_ctx = ctx or self._current_ctx
+        await vectorize_file(
+            file_path=file_path,
+            summary_dict=summary_dict,
+            parent_uri=parent_uri,
+            context_type=context_type,
+            ctx=active_ctx,
+        )

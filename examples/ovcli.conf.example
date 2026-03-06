@@ -1,5 +1,8 @@
 {
   "url": "http://localhost:1933",
   "api_key": null,
-  "output": "table"
+  "agent_id": null,
+  "timeout": 60.0,
+  "output": "table",
+  "echo_command": true
 }

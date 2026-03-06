@@ -54,6 +54,7 @@ coverage.xml
 .ruff_cache/
 cover/
 test_data/
+test_data_sync/
 
 # Virtual environments
 .env
@@ -101,6 +102,7 @@ Temporary Items
 /benchmark_data/*
 .claude
 .openviking
+*.code-workspace
 
 # AI Coding
 CLAUDE.md
@@ -155,17 +157,8 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 openviking/bin/
-test_scripts/
-test_large_scale_collection/
-
-# Test-generated directories
-.tmp_*/
-db_test_*/
-test_recall_collection/
-test_db_*/
-test_project_root/
-benchmark_stress_db/
-examples/data/
 third_party/agfs/bin/
+test_scripts/
+examples/data/
 openviking/_version.py
 specs/

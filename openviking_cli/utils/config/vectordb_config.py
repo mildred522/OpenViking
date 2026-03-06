@@ -1,10 +1,14 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from openviking_cli.utils.logger import get_logger
+
 COLLECTION_NAME = "context"
+DEFAULT_PROJECT_NAME = "default"
+logger = get_logger(__name__)
 
 
 class VolcengineConfig(BaseModel):
@@ -15,7 +19,13 @@ class VolcengineConfig(BaseModel):
     region: Optional[str] = Field(
         default=None, description="Volcengine region (e.g., 'cn-beijing')"
     )
-    host: Optional[str] = Field(default=None, description="Volcengine VikingDB host (optional)")
+    host: Optional[str] = Field(
+        default=None,
+        description=(
+            "[Deprecated] Ignored in volcengine mode. "
+            "Hosts are derived from `region` to route console/data APIs correctly."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -46,11 +56,18 @@ class VectorDBBackendConfig(BaseModel):
 
     name: Optional[str] = Field(default=COLLECTION_NAME, description="Collection name for VectorDB")
 
-    path: Optional[str] = Field(default="./data", description="Local storage path for 'local' type")
+    path: Optional[str] = Field(
+        default=None,
+        description="[Deprecated in favor of `storage.workspace`] Local storage path for 'local' type. This will be ignored if `storage.workspace` is set.",
+    )
 
     url: Optional[str] = Field(
         default=None,
         description="Remote service URL for 'http' type (e.g., 'http://localhost:5000')",
+    )
+
+    project_name: Optional[str] = Field(
+        default=DEFAULT_PROJECT_NAME, description="project name", alias="project"
     )
 
     distance_metric: str = Field(
@@ -82,19 +99,31 @@ class VectorDBBackendConfig(BaseModel):
         description="VikingDB private deployment configuration for 'vikingdb' type",
     )
 
+    custom_params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Custom parameters for custom backend adapters",
+    )
+
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
     def validate_config(self):
         """Validate configuration completeness and consistency"""
-        if self.backend not in ["local", "http", "volcengine", "vikingdb"]:
+        standard_backends = ["local", "http", "volcengine", "vikingdb"]
+
+        # Allow custom backend classes (containing dot) without standard validation
+        if "." in self.backend:
+            logger.info("Using custom VectorDB backend: %s", self.backend)
+            return self
+
+        if self.backend not in standard_backends:
             raise ValueError(
-                f"Invalid VectorDB backend: '{self.backend}'. Must be one of: 'local', 'http', 'volcengine', 'vikingdb'"
+                f"Invalid VectorDB backend: '{self.backend}'. Must be one of: {standard_backends} "
+                "or a valid Python class path."
             )
 
         if self.backend == "local":
-            if not self.path:
-                raise ValueError("VectorDB local backend requires 'path' to be set")
+            pass
 
         elif self.backend == "http":
             if not self.url:
@@ -105,6 +134,12 @@ class VectorDBBackendConfig(BaseModel):
                 raise ValueError("VectorDB volcengine backend requires 'ak' and 'sk' to be set")
             if not self.volcengine.region:
                 raise ValueError("VectorDB volcengine backend requires 'region' to be set")
+            if self.volcengine.host:
+                logger.warning(
+                    "VectorDB volcengine backend: 'volcengine.host' is deprecated and ignored. "
+                    "Using region-based console/data hosts for region='%s'.",
+                    self.volcengine.region,
+                )
 
         elif self.backend == "vikingdb":
             if not self.vikingdb or not self.vikingdb.host:

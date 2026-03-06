@@ -8,11 +8,15 @@ and rerank-based relevance scoring.
 """
 
 import heapq
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from openviking.models.embedder.base import EmbedResult
-from openviking.storage import VikingDBInterface
+from openviking.retrieve.memory_lifecycle import hotness_score
+from openviking.server.identity import RequestContext, Role
+from openviking.storage import VikingVectorIndexBackend
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.retrieve.types import (
     ContextType,
     MatchedContext,
@@ -39,21 +43,23 @@ class HierarchicalRetriever:
     SCORE_PROPAGATION_ALPHA = 0.5  # Score propagation coefficient
     DIRECTORY_DOMINANCE_RATIO = 1.2  # Directory score must exceed max child score
     GLOBAL_SEARCH_TOPK = 3  # Global retrieval count
+    HOTNESS_ALPHA = 0.2  # Weight for hotness score in final ranking (0 = disabled)
+    LEVEL_URI_SUFFIX = {0: ".abstract.md", 1: ".overview.md"}
 
     def __init__(
         self,
-        storage: VikingDBInterface,
+        storage: VikingVectorIndexBackend,
         embedder: Optional[Any],
         rerank_config: Optional[RerankConfig] = None,
     ):
         """Initialize hierarchical retriever with rerank_config.
 
         Args:
-            storage: VikingDBInterface instance
+            storage: VikingVectorIndexBackend instance
             embedder: Embedder instance (supports dense/sparse/hybrid)
             rerank_config: Rerank configuration (optional, will fallback to vector search only)
         """
-        self.storage = storage
+        self.vector_store = storage
         self.embedder = embedder
         self.rerank_config = rerank_config
 
@@ -76,11 +82,12 @@ class HierarchicalRetriever:
     async def retrieve(
         self,
         query: TypedQuery,
+        ctx: RequestContext,
         limit: int = 5,
         mode: RetrieverMode = RetrieverMode.THINKING,
         score_threshold: Optional[float] = None,
         score_gte: bool = False,
-        metadata_filter: Optional[Dict[str, Any]] = None,
+        scope_dsl: Optional[Dict[str, Any]] = None,
     ) -> QueryResult:
         """
         Execute hierarchical retrieval.
@@ -90,26 +97,19 @@ class HierarchicalRetriever:
             score_threshold: Custom score threshold (overrides config)
             score_gte: True uses >=, False uses >
             grep_patterns: Keyword match pattern list
-            metadata_filter: Additional metadata filter conditions
+            scope_dsl: Additional scope constraints passed from public find/search filter
         """
 
         # Use custom threshold or default threshold
         effective_threshold = score_threshold if score_threshold is not None else self.threshold
 
-        collection = self._type_to_collection(query.context_type)
+        target_dirs = [d for d in (query.target_directories or []) if d]
 
-        # Create context_type filter
-        type_filter = {"op": "must", "field": "context_type", "conds": [query.context_type.value]}
-
-        # Merge all filters
-        filters_to_merge = [type_filter]
-        if metadata_filter:
-            filters_to_merge.append(metadata_filter)
-
-        final_metadata_filter = {"op": "and", "conds": filters_to_merge}
-
-        if not await self.storage.collection_exists(collection):
-            logger.warning(f"[RecursiveSearch] Collection {collection} does not exist")
+        if not await self.vector_store.collection_exists_bound():
+            logger.warning(
+                "[RecursiveSearch] Collection %s does not exist",
+                self.vector_store.collection_name,
+            )
             return QueryResult(
                 query=query,
                 matched_contexts=[],
@@ -124,16 +124,21 @@ class HierarchicalRetriever:
             query_vector = result.dense_vector
             sparse_query_vector = result.sparse_vector
 
-        # Step 1: Determine starting directories based on context_type
-        root_uris = self._get_root_uris_for_type(query.context_type)
+        # Step 1: Determine starting directories based on target_directories or context_type
+        if target_dirs:
+            root_uris = target_dirs
+        else:
+            root_uris = self._get_root_uris_for_type(query.context_type, ctx=ctx)
 
         # Step 2: Global vector search to supplement starting points
         global_results = await self._global_vector_search(
-            collection=collection,
+            ctx=ctx,
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
+            context_type=query.context_type.value if query.context_type else None,
+            target_dirs=target_dirs,
+            scope_dsl=scope_dsl,
             limit=self.GLOBAL_SEARCH_TOPK,
-            filter=final_metadata_filter,
         )
 
         # Step 3: Merge starting points
@@ -142,7 +147,7 @@ class HierarchicalRetriever:
         # Step 4: Recursive search
         candidates = await self._recursive_search(
             query=query.query,
-            collection=collection,
+            ctx=ctx,
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
             starting_points=starting_points,
@@ -150,11 +155,13 @@ class HierarchicalRetriever:
             mode=mode,
             threshold=effective_threshold,
             score_gte=score_gte,
-            metadata_filter=final_metadata_filter,
+            context_type=query.context_type.value if query.context_type else None,
+            target_dirs=target_dirs,
+            scope_dsl=scope_dsl,
         )
 
         # Step 6: Convert results
-        matched = await self._convert_to_matched_contexts(candidates, query.context_type)
+        matched = await self._convert_to_matched_contexts(candidates, ctx=ctx)
 
         return QueryResult(
             query=query,
@@ -164,26 +171,22 @@ class HierarchicalRetriever:
 
     async def _global_vector_search(
         self,
-        collection: str,
+        ctx: RequestContext,
         query_vector: Optional[List[float]],
         sparse_query_vector: Optional[Dict[str, float]],
+        context_type: Optional[str],
+        target_dirs: List[str],
+        scope_dsl: Optional[Dict[str, Any]],
         limit: int,
-        filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Global vector search to locate initial directories."""
-        if not query_vector:
-            return []
-        sparse_query_vector = sparse_query_vector or {}
-
-        global_filter = {
-            "op": "and",
-            "conds": [filter, {"op": "must", "field": "is_leaf", "conds": [False]}],
-        }
-        results = await self.storage.search(
-            collection=collection,
+        results = await self.vector_store.search_global_roots_in_tenant(
+            ctx=ctx,
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
-            filter=global_filter,
+            context_type=context_type,
+            target_directories=target_dirs,
+            extra_filter=scope_dsl,
             limit=limit,
         )
         return results
@@ -229,7 +232,7 @@ class HierarchicalRetriever:
     async def _recursive_search(
         self,
         query: str,
-        collection: str,
+        ctx: RequestContext,
         query_vector: Optional[List[float]],
         sparse_query_vector: Optional[Dict[str, float]],
         starting_points: List[Tuple[str, float]],
@@ -237,7 +240,9 @@ class HierarchicalRetriever:
         mode: str,
         threshold: Optional[float] = None,
         score_gte: bool = False,
-        metadata_filter: Optional[Dict[str, Any]] = None,
+        context_type: Optional[str] = None,
+        target_dirs: Optional[List[str]] = None,
+        scope_dsl: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recursive search with directory priority return and score propagation.
@@ -246,7 +251,7 @@ class HierarchicalRetriever:
             threshold: Score threshold
             score_gte: True uses >=, False uses >
             grep_patterns: Keyword match patterns
-            metadata_filter: Additional metadata filter conditions
+            scope_dsl: Additional scope constraints from public find/search filter
         """
         # Use passed threshold or default threshold
         effective_threshold = threshold if threshold is not None else self.threshold
@@ -257,15 +262,9 @@ class HierarchicalRetriever:
                 return score >= effective_threshold
             return score > effective_threshold
 
-        def merge_filter(base_filter: Dict, extra_filter: Optional[Dict]) -> Dict:
-            """Merge filter conditions."""
-            if not extra_filter:
-                return base_filter
-            return {"op": "and", "conds": [base_filter, extra_filter]}
-
         sparse_query_vector = sparse_query_vector or None
 
-        collected: List[Dict[str, Any]] = []  # Collected results (directories and leaves)
+        collected_by_uri: Dict[str, Dict[str, Any]] = {}
         dir_queue: List[tuple] = []  # Priority queue: (-score, uri)
         visited: set = set()
         prev_topk_uris: set = set()
@@ -287,13 +286,14 @@ class HierarchicalRetriever:
 
             pre_filter_limit = max(limit * 2, 20)
 
-            results = await self.storage.search(
-                collection=collection,
+            results = await self.vector_store.search_children_in_tenant(
+                ctx=ctx,
+                parent_uri=current_uri,
                 query_vector=query_vector,
                 sparse_query_vector=sparse_query_vector,  # Pass sparse vector
-                filter=merge_filter(
-                    {"op": "must", "field": "parent_uri", "conds": [current_uri]}, metadata_filter
-                ),
+                context_type=context_type,
+                target_directories=target_dirs,
+                extra_filter=scope_dsl,
                 limit=pre_filter_limit,
             )
 
@@ -320,25 +320,33 @@ class HierarchicalRetriever:
                     alpha * score + (1 - alpha) * current_score if current_score else score
                 )
 
-                if passes_threshold(final_score) and uri not in visited:
-                    r["_final_score"] = final_score
-                    collected.append(r)
-                    logger.debug(
-                        f"[RecursiveSearch] Added URI: {uri} to candidates with score: {final_score}"
-                    )
-                    if r.get("is_leaf"):
-                        visited.add(uri)
-                        continue
-                    heapq.heappush(dir_queue, (-final_score, uri))
-                else:
+                if not passes_threshold(final_score):
                     logger.debug(
                         f"[RecursiveSearch] URI {uri} score {final_score} did not pass threshold {effective_threshold}"
                     )
+                    continue
+
+                # Deduplicate by URI and keep the highest-scored candidate.
+                previous = collected_by_uri.get(uri)
+                if previous is None or final_score > previous.get("_final_score", 0):
+                    r["_final_score"] = final_score
+                    collected_by_uri[uri] = r
+                    logger.debug(
+                        "[RecursiveSearch] Updated URI: %s candidate score to %.4f",
+                        uri,
+                        final_score,
+                    )
+
+                # Only recurse into directories (L0/L1). L2 files are terminal hits.
+                if uri not in visited and r.get("level", 2) != 2:
+                    heapq.heappush(dir_queue, (-final_score, uri))
 
             # Convergence check
-            current_topk = sorted(collected, key=lambda x: x.get("_final_score", 0), reverse=True)[
-                :limit
-            ]
+            current_topk = sorted(
+                collected_by_uri.values(),
+                key=lambda x: x.get("_final_score", 0),
+                reverse=True,
+            )[:limit]
             current_topk_uris = {c.get("uri", "") for c in current_topk}
 
             if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
@@ -350,57 +358,124 @@ class HierarchicalRetriever:
                 convergence_rounds = 0
                 prev_topk_uris = current_topk_uris
 
-        collected.sort(key=lambda x: x.get("_final_score", 0), reverse=True)
+        collected = sorted(
+            collected_by_uri.values(),
+            key=lambda x: x.get("_final_score", 0),
+            reverse=True,
+        )
         return collected[:limit]
 
     async def _convert_to_matched_contexts(
         self,
         candidates: List[Dict[str, Any]],
-        context_type: ContextType,
+        ctx: RequestContext,
     ) -> List[MatchedContext]:
-        """Convert candidate results to MatchedContext list."""
+        """Convert candidate results to MatchedContext list.
+
+        Blends semantic similarity with a hotness score derived from
+        ``active_count`` and ``updated_at`` so that frequently-accessed,
+        recently-updated contexts get a ranking boost.  The blend weight
+        is controlled by ``HOTNESS_ALPHA`` (0 disables the boost).
+        """
         results = []
 
         for c in candidates:
             # Read related contexts and get summaries
             relations = []
             if get_viking_fs():
-                related_uris = await get_viking_fs().get_relations(c.get("uri", ""))
+                related_uris = await get_viking_fs().get_relations(c.get("uri", ""), ctx=ctx)
                 if related_uris:
                     related_abstracts = await get_viking_fs().read_batch(
-                        related_uris[: self.MAX_RELATIONS], level="l0"
+                        related_uris[: self.MAX_RELATIONS], level="l0", ctx=ctx
                     )
                     for uri in related_uris[: self.MAX_RELATIONS]:
                         abstract = related_abstracts.get(uri, "")
                         if abstract:
                             relations.append(RelatedContext(uri=uri, abstract=abstract))
 
+            semantic_score = c.get("_final_score", c.get("_score", 0.0))
+
+            # --- hotness boost ---
+            updated_at_raw = c.get("updated_at")
+            if isinstance(updated_at_raw, str):
+                try:
+                    updated_at_val = parse_iso_datetime(updated_at_raw)
+                except (ValueError, TypeError):
+                    updated_at_val = None
+            elif isinstance(updated_at_raw, datetime):
+                updated_at_val = updated_at_raw
+            else:
+                updated_at_val = None
+
+            h_score = hotness_score(
+                active_count=c.get("active_count", 0),
+                updated_at=updated_at_val,
+            )
+
+            alpha = self.HOTNESS_ALPHA
+            final_score = (1 - alpha) * semantic_score + alpha * h_score
+            level = c.get("level", 2)
+            display_uri = self._append_level_suffix(c.get("uri", ""), level)
+
             results.append(
                 MatchedContext(
-                    uri=c.get("uri", ""),
-                    context_type=context_type,
-                    is_leaf=c.get("is_leaf", False),
+                    uri=display_uri,
+                    context_type=ContextType(c["context_type"])
+                    if c.get("context_type")
+                    else ContextType.RESOURCE,
+                    level=level,
                     abstract=c.get("abstract", ""),
                     category=c.get("category", ""),
-                    score=c.get("_final_score", c.get("_score", 0.0)),
+                    score=final_score,
                     relations=relations,
                 )
             )
 
+        # Re-sort by blended score so hotness boost can change ranking
+        results.sort(key=lambda x: x.score, reverse=True)
         return results
 
-    def _get_root_uris_for_type(self, context_type: ContextType) -> List[str]:
-        """Return starting directory URI list based on context_type."""
-        if context_type == ContextType.MEMORY:
-            return ["viking://user/memories", "viking://agent/memories"]
+    @classmethod
+    def _append_level_suffix(cls, uri: str, level: int) -> str:
+        """Return user-facing URI with L0/L1 suffix reconstructed by level."""
+        suffix = cls.LEVEL_URI_SUFFIX.get(level)
+        if not uri or not suffix:
+            return uri
+        if uri.endswith(f"/{suffix}"):
+            return uri
+        if uri.endswith("/.abstract.md") or uri.endswith("/.overview.md"):
+            return uri
+        if uri.endswith("/") and not uri.endswith("://"):
+            uri = uri.rstrip("/")
+        return f"{uri}/{suffix}"
+
+    def _get_root_uris_for_type(
+        self, context_type: Optional[ContextType], ctx: Optional[RequestContext] = None
+    ) -> List[str]:
+        """Return starting directory URI list based on context_type and user context.
+
+        When context_type is None, returns roots for all types.
+        ROOT has no space, relies on global_vector_search without URI prefix filter.
+        """
+        if not ctx or ctx.role == Role.ROOT:
+            return []
+
+        user_space = ctx.user.user_space_name()
+        agent_space = ctx.user.agent_space_name()
+        if context_type is None:
+            return [
+                f"viking://user/{user_space}/memories",
+                f"viking://agent/{agent_space}/memories",
+                "viking://resources",
+                f"viking://agent/{agent_space}/skills",
+            ]
+        elif context_type == ContextType.MEMORY:
+            return [
+                f"viking://user/{user_space}/memories",
+                f"viking://agent/{agent_space}/memories",
+            ]
         elif context_type == ContextType.RESOURCE:
             return ["viking://resources"]
         elif context_type == ContextType.SKILL:
-            return ["viking://agent/skills"]
+            return [f"viking://agent/{agent_space}/skills"]
         return []
-
-    def _type_to_collection(self, context_type: ContextType) -> str:
-        """
-        Convert context type to collection name.
-        """
-        return "context"

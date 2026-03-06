@@ -7,9 +7,7 @@ import httpx
 
 
 async def test_ls_root(client: httpx.AsyncClient):
-    resp = await client.get(
-        "/api/v1/fs/ls", params={"uri": "viking://"}
-    )
+    resp = await client.get("/api/v1/fs/ls", params={"uri": "viking://"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -25,6 +23,25 @@ async def test_ls_simple(client: httpx.AsyncClient):
     body = resp.json()
     assert body["status"] == "ok"
     assert isinstance(body["result"], list)
+    # Each item must be a non-empty URI string (fixes #218)
+    for item in body["result"]:
+        assert isinstance(item, str)
+        assert item.startswith("viking://")
+
+
+async def test_ls_simple_agent_output(client: httpx.AsyncClient):
+    """Ensure --simple with output=agent returns URI strings, not empty."""
+    resp = await client.get(
+        "/api/v1/fs/ls",
+        params={"uri": "viking://", "simple": True, "output": "agent"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert isinstance(body["result"], list)
+    for item in body["result"]:
+        assert isinstance(item, str)
+        assert item.startswith("viking://")
 
 
 async def test_mkdir_and_ls(client: httpx.AsyncClient):
@@ -43,9 +60,7 @@ async def test_mkdir_and_ls(client: httpx.AsyncClient):
 
 
 async def test_tree(client: httpx.AsyncClient):
-    resp = await client.get(
-        "/api/v1/fs/tree", params={"uri": "viking://"}
-    )
+    resp = await client.get("/api/v1/fs/tree", params={"uri": "viking://"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -53,9 +68,7 @@ async def test_tree(client: httpx.AsyncClient):
 
 async def test_stat_after_add_resource(client_with_resource):
     client, uri = client_with_resource
-    resp = await client.get(
-        "/api/v1/fs/stat", params={"uri": uri}
-    )
+    resp = await client.get("/api/v1/fs/stat", params={"uri": uri})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -73,9 +86,7 @@ async def test_stat_not_found(client: httpx.AsyncClient):
 
 async def test_rm_resource(client_with_resource):
     client, uri = client_with_resource
-    resp = await client.request(
-        "DELETE", "/api/v1/fs", params={"uri": uri, "recursive": True}
-    )
+    resp = await client.request("DELETE", "/api/v1/fs", params={"uri": uri, "recursive": True})
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
 

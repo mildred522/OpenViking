@@ -5,12 +5,13 @@ OpenViking 同步客户端示例 (HTTP mode)
 使用 SyncHTTPClient 通过 HTTP 连接远程 Server，演示完整 API。
 
 前置条件:
-    先启动 Server: openviking serve
+    先启动 Server: openviking-server
 
 运行:
     uv run client_sync.py
     uv run client_sync.py --url http://localhost:1933
     uv run client_sync.py --api-key your-secret-key
+    uv run client_sync.py --agent-id my-agent
 """
 
 import argparse
@@ -62,9 +63,13 @@ def main():
     parser = argparse.ArgumentParser(description="OpenViking sync client example")
     parser.add_argument("--url", default="http://localhost:1933", help="Server URL")
     parser.add_argument("--api-key", default=None, help="API key")
+    parser.add_argument("--agent-id", default=None, help="Agent ID")
+    parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
     args = parser.parse_args()
 
-    client = ov.SyncHTTPClient(url=args.url, api_key=args.api_key)
+    client = ov.SyncHTTPClient(
+        url=args.url, api_key=args.api_key, agent_id=args.agent_id, timeout=args.timeout
+    )
 
     try:
         # ── Connect ──

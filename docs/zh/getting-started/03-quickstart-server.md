@@ -4,7 +4,7 @@
 
 ## 前置要求
 
-- 已安装 OpenViking（`pip install openviking`）
+- 已安装 OpenViking（`pip install openviking --upgrade --force-reinstall`）
 - 模型配置已就绪（参见 [快速开始](02-quickstart.md) 了解配置方法）
 
 ## 启动服务
@@ -13,13 +13,13 @@
 
 ```bash
 # 配置文件在默认路径 ~/.openviking/ov.conf 时，直接启动
-python -m openviking serve
+openviking-server
 
 # 配置文件在其他位置时，通过 --config 指定
-python -m openviking serve --config /path/to/ov.conf
+openviking-server --config /path/to/ov.conf
 
 # 覆盖 host/port
-python -m openviking serve --port 1933
+openviking-server --port 1933
 ```
 
 你应该看到：
@@ -43,12 +43,12 @@ import openviking as ov
 client = ov.SyncHTTPClient(url="http://localhost:1933")
 ```
 
-如果服务端启用了认证，需要传入 `api_key`：
+如果服务端启用了认证，需要传入 `api_key`，可选传入 `agent_id`：
 
 ```python
 import openviking as ov
 
-client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key", agent_id="my-agent")
 ```
 
 **完整示例：**
@@ -244,7 +244,7 @@ vim ~/.openviking/ov.conf
     "api_key"    : "<your-api-key>",     // Model service API Key
     "provider"   : "<provider-type>",    // Provider type (volcengine or openai)
     "max_retries": 2,
-    "model"      : "<model-name>"        // VLM model name (e.g., doubao-seed-1-8-251228 or gpt-4-vision-preview)
+    "model"      : "<model-name>"        // VLM model name (e.g., doubao-seed-2-0-pro-260215 or gpt-4-vision-preview)
   }
 }
 ```

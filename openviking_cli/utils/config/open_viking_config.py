@@ -9,12 +9,15 @@ from pydantic import BaseModel, Field
 
 from openviking_cli.session.user_id import UserIdentifier
 
-from .config_loader import (
+from .config_loader import resolve_config_path
+from .consts import (
+    DEFAULT_CONFIG_DIR,
     DEFAULT_OV_CONF,
     OPENVIKING_CONFIG_ENV,
-    resolve_config_path,
+    SYSTEM_CONFIG_DIR,
 )
 from .embedding_config import EmbeddingConfig
+from .log_config import LogConfig
 from .parser_config import (
     AudioConfig,
     CodeConfig,
@@ -115,18 +118,7 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
-    log_level: str = Field(
-        default="WARNING", description="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL"
-    )
-
-    log_format: str = Field(
-        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        description="Log format string",
-    )
-
-    log_output: str = Field(
-        default="stdout", description="Log output: stdout, stderr, or file path"
-    )
+    log: LogConfig = Field(default_factory=lambda: LogConfig(), description="Logging configuration")
 
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
 
@@ -138,19 +130,25 @@ class OpenVikingConfig(BaseModel):
 
         # Remove sections managed by other loaders (e.g. server config)
         config_copy.pop("server", None)
-        
+        config_copy.pop("bot", None)
+
         # Handle parser configurations from nested "parsers" section
         parser_configs = {}
         if "parsers" in config_copy:
             parser_configs = config_copy.pop("parsers")
-
-        # Also check for individual parser configs at root level
         parser_types = ["pdf", "code", "image", "audio", "video", "markdown", "html", "text"]
         for parser_type in parser_types:
             if parser_type in config_copy:
                 parser_configs[parser_type] = config_copy.pop(parser_type)
+        # Handle log configuration from nested "log" section
+        log_config_data = None
+        if "log" in config_copy:
+            log_config_data = config_copy.pop("log")
 
         instance = cls(**config_copy)
+        # Apply log configuration
+        if log_config_data is not None:
+            instance.log = LogConfig.from_dict(log_config_data)
 
         # Apply parser configurations
         for parser_type, parser_data in parser_configs.items():
@@ -172,7 +170,8 @@ class OpenVikingConfigSingleton:
       1. Explicit path passed to initialize()
       2. OPENVIKING_CONFIG_FILE environment variable
       3. ~/.openviking/ov.conf
-      4. Error with clear guidance
+      4. /etc/openviking/ov.conf
+      5. Error with clear guidance
     """
 
     _instance: Optional[OpenVikingConfig] = None
@@ -191,12 +190,11 @@ class OpenVikingConfigSingleton:
                     if config_path is not None:
                         cls._instance = cls._load_from_file(str(config_path))
                     else:
-                        from .config_loader import DEFAULT_CONFIG_DIR
-
-                        default_path = DEFAULT_CONFIG_DIR / DEFAULT_OV_CONF
+                        default_path_user = DEFAULT_CONFIG_DIR / DEFAULT_OV_CONF
+                        default_path_system = SYSTEM_CONFIG_DIR / DEFAULT_OV_CONF
                         raise FileNotFoundError(
                             f"OpenViking configuration file not found.\n"
-                            f"Please create {default_path} or set {OPENVIKING_CONFIG_ENV}.\n"
+                            f"Please create {default_path_user} or {default_path_system}, or set {OPENVIKING_CONFIG_ENV}.\n"
                             f"See: https://openviking.dev/docs/guides/configuration"
                         )
         return cls._instance
@@ -221,12 +219,11 @@ class OpenVikingConfigSingleton:
                 if path is not None:
                     cls._instance = cls._load_from_file(str(path))
                 else:
-                    from .config_loader import DEFAULT_CONFIG_DIR
-
-                    default_path = DEFAULT_CONFIG_DIR / DEFAULT_OV_CONF
+                    default_path_user = DEFAULT_CONFIG_DIR / DEFAULT_OV_CONF
+                    default_path_system = SYSTEM_CONFIG_DIR / DEFAULT_OV_CONF
                     raise FileNotFoundError(
                         f"OpenViking configuration file not found.\n"
-                        f"Please create {default_path} or set {OPENVIKING_CONFIG_ENV}.\n"
+                        f"Please create {default_path_user} or {default_path_system}, or set {OPENVIKING_CONFIG_ENV}.\n"
                         f"See: https://openviking.dev/docs/guides/configuration"
                     )
         return cls._instance
@@ -316,7 +313,7 @@ def initialize_openviking_config(
 
     Args:
         user: UserIdentifier for session management
-        path: Local storage path for embedded mode
+        path: Local storage path (workspace) for embedded mode
 
     Returns:
         Configured OpenVikingConfig instance
@@ -337,9 +334,15 @@ def initialize_openviking_config(
     if path:
         # Embedded mode: local storage
         config.storage.agfs.backend = config.storage.agfs.backend or "local"
-        config.storage.agfs.path = path
         config.storage.vectordb.backend = config.storage.vectordb.backend or "local"
-        config.storage.vectordb.path = path
+        # Resolve and update workspace + dependent paths (model_validator won't
+        # re-run on attribute assignment, so sync agfs.path / vectordb.path here).
+        workspace_path = Path(path).resolve()
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        resolved = str(workspace_path)
+        config.storage.workspace = resolved
+        config.storage.agfs.path = resolved
+        config.storage.vectordb.path = resolved
 
     # Ensure vector dimension is synced if not set in storage
     if config.storage.vectordb.dimension == 0:

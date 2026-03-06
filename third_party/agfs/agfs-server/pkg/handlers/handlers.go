@@ -10,12 +10,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/c4pt0r/agfs/agfs-server/pkg/mountablefs"
 	log "github.com/sirupsen/logrus"
 	"github.com/zeebo/xxh3"
 )
@@ -814,6 +818,7 @@ type GrepRequest struct {
 	Recursive       bool   `json:"recursive"`        // Whether to search recursively in directories
 	CaseInsensitive bool   `json:"case_insensitive"` // Case-insensitive matching
 	Stream          bool   `json:"stream"`           // Stream results as NDJSON (one match per line)
+	NodeLimit       int    `json:"node_limit"`       // Maximum number of results to return (0 means no limit)
 }
 
 // GrepMatch represents a single match result
@@ -828,6 +833,12 @@ type GrepResponse struct {
 	Matches []GrepMatch `json:"matches"` // All matches
 	Count   int         `json:"count"`   // Total number of matches
 }
+
+type localPathResolver interface {
+	ResolvePath(path string) string
+}
+
+var rgVimgrepSepRe = regexp.MustCompile(`:(\d+):(\d+):`)
 
 // Grep searches for a pattern in files
 func (h *Handler) Grep(w http.ResponseWriter, r *http.Request) {
@@ -860,6 +871,8 @@ func (h *Handler) Grep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	localPath, basePath, mountPath, useRipgrep := h.resolveRipgrepPath(req.Path)
+
 	// Check if path exists and get file info
 	info, err := h.fs.Stat(req.Path)
 	if err != nil {
@@ -870,7 +883,11 @@ func (h *Handler) Grep(w http.ResponseWriter, r *http.Request) {
 
 	// Handle stream mode
 	if req.Stream {
-		h.grepStream(w, req.Path, re, info.IsDir, req.Recursive)
+		if useRipgrep {
+			h.grepStreamRipgrep(w, localPath, basePath, mountPath, req.Pattern, info.IsDir, req.Recursive, req.CaseInsensitive, req.NodeLimit)
+		} else {
+			h.grepStream(w, req.Path, re, info.IsDir, req.Recursive, req.NodeLimit)
+		}
 		return
 	}
 
@@ -880,18 +897,21 @@ func (h *Handler) Grep(w http.ResponseWriter, r *http.Request) {
 	// Search in file or directory
 	if info.IsDir {
 		if req.Recursive {
-			matches, err = h.grepDirectory(req.Path, re)
+			if useRipgrep {
+				matches, err = h.grepWithRipgrep(localPath, basePath, mountPath, req.Pattern, req.CaseInsensitive, req.NodeLimit)
+			} else {
+				matches, err = h.grepDirectory(req.Path, re, req.NodeLimit)
+			}
 		} else {
 			writeError(w, http.StatusBadRequest, "path is a directory, use recursive=true to search")
 			return
 		}
 	} else {
-		matches, err = h.grepFile(req.Path, re)
-	}
-
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "grep failed: "+err.Error())
-		return
+		if useRipgrep {
+			matches, err = h.grepWithRipgrep(localPath, basePath, mountPath, req.Pattern, req.CaseInsensitive, req.NodeLimit)
+		} else {
+			matches, err = h.grepFile(req.Path, re, req.NodeLimit)
+		}
 	}
 
 	response := GrepResponse{
@@ -902,8 +922,239 @@ func (h *Handler) Grep(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (h *Handler) resolveRipgrepPath(vfsPath string) (string, string, string, bool) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		return "", "", "", false
+	}
+
+	if mfs, ok := h.fs.(*mountablefs.MountableFS); ok {
+		mount, relPath, found := findMountForPath(mfs.GetMounts(), vfsPath)
+		if !found {
+			return "", "", "", false
+		}
+		resolver, ok := mount.Plugin.GetFileSystem().(localPathResolver)
+		if !ok {
+			return "", "", "", false
+		}
+		localPath := resolver.ResolvePath(relPath)
+		basePath := resolver.ResolvePath("/")
+		return localPath, basePath, mount.Path, true
+	}
+
+	resolver, ok := h.fs.(localPathResolver)
+	if !ok {
+		return "", "", "", false
+	}
+	localPath := resolver.ResolvePath(vfsPath)
+	basePath := resolver.ResolvePath("/")
+	return localPath, basePath, "/", true
+}
+
+func (h *Handler) grepStreamRipgrep(w http.ResponseWriter, localPath string, basePath string, mountPath string, pattern string, isDir bool, recursive bool, caseInsensitive bool, nodeLimit int) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Error("Streaming not supported")
+		return
+	}
+
+	matchCount := 0
+	encoder := json.NewEncoder(w)
+
+	sendMatch := func(match GrepMatch) error {
+		matchCount++
+		if err := encoder.Encode(match); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	var err error
+	if isDir {
+		if !recursive {
+			errMatch := map[string]interface{}{
+				"error": "path is a directory, use recursive=true to search",
+			}
+			encoder.Encode(errMatch)
+			flusher.Flush()
+			return
+		}
+		_, err = h.grepWithRipgrepStream(localPath, basePath, mountPath, pattern, caseInsensitive, nodeLimit, sendMatch)
+	} else {
+		_, err = h.grepWithRipgrepStream(localPath, basePath, mountPath, pattern, caseInsensitive, nodeLimit, sendMatch)
+	}
+
+	summary := map[string]interface{}{
+		"type":  "summary",
+		"count": matchCount,
+	}
+	if err != nil {
+		summary["error"] = err.Error()
+	}
+	encoder.Encode(summary)
+	flusher.Flush()
+}
+
+func (h *Handler) grepWithRipgrep(localPath string, basePath string, mountPath string, pattern string, caseInsensitive bool, nodeLimit int) ([]GrepMatch, error) {
+	matches := make([]GrepMatch, 0)
+	_, err := h.grepWithRipgrepStream(localPath, basePath, mountPath, pattern, caseInsensitive, nodeLimit, func(match GrepMatch) error {
+		matches = append(matches, match)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func (h *Handler) grepWithRipgrepStream(localPath string, basePath string, mountPath string, pattern string, caseInsensitive bool, nodeLimit int, callback func(GrepMatch) error) (int, error) {
+	args := []string{"--vimgrep", "--no-heading", "--color=never"}
+	if caseInsensitive {
+		args = append(args, "-i")
+	}
+	if nodeLimit > 0 {
+		args = append(args, "--max-count", strconv.Itoa(nodeLimit))
+	}
+	args = append(args, "--", pattern, localPath)
+
+	cmd := exec.Command("rg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+
+	count := 0
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		filePath, lineNum, content, ok := parseRipgrepLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		vfsPath := vfsPathFromLocal(basePath, mountPath, filePath)
+		match := GrepMatch{
+			File:    vfsPath,
+			Line:    lineNum,
+			Content: content,
+		}
+		if err := callback(match); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return count, err
+		}
+		count++
+		if nodeLimit > 0 && count >= nodeLimit {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return count, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return count, err
+	}
+	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				return count, nil
+			}
+			if stderr.Len() > 0 {
+				return count, errors.New(strings.TrimSpace(stderr.String()))
+			}
+		}
+		return count, err
+	}
+	return count, nil
+}
+
+func parseRipgrepLine(line string) (string, int, string, bool) {
+	matches := rgVimgrepSepRe.FindAllStringSubmatchIndex(line, -1)
+	if len(matches) == 0 {
+		return "", 0, "", false
+	}
+	m := matches[0]
+	if len(m) < 6 {
+		return "", 0, "", false
+	}
+	filePath := line[:m[0]]
+	lineStr := line[m[2]:m[3]]
+	content := line[m[1]:]
+	lineNum, err := strconv.Atoi(lineStr)
+	if err != nil {
+		return "", 0, "", false
+	}
+	return filePath, lineNum, content, true
+}
+
+func vfsPathFromLocal(basePath string, mountPath string, localPath string) string {
+	rel, err := filepath.Rel(basePath, localPath)
+	if err != nil {
+		return localPath
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." {
+		return mountPath
+	}
+	if strings.HasPrefix(rel, "..") {
+		return localPath
+	}
+	mountPath = path.Clean("/" + strings.TrimPrefix(mountPath, "/"))
+	if mountPath == "/" {
+		return "/" + rel
+	}
+	return mountPath + "/" + rel
+}
+
+func findMountForPath(mounts []*mountablefs.MountPoint, targetPath string) (*mountablefs.MountPoint, string, bool) {
+	targetPath = filesystem.NormalizePath(targetPath)
+	var best *mountablefs.MountPoint
+	bestLen := -1
+	bestRel := ""
+
+	for _, m := range mounts {
+		mountPath := filesystem.NormalizePath(m.Path)
+		rel, ok := matchMountPath(mountPath, targetPath)
+		if !ok {
+			continue
+		}
+		if len(mountPath) > bestLen {
+			best = m
+			bestLen = len(mountPath)
+			bestRel = rel
+		}
+	}
+
+	if best == nil {
+		return nil, "", false
+	}
+	return best, bestRel, true
+}
+
+func matchMountPath(mountPath string, targetPath string) (string, bool) {
+	if mountPath == "/" {
+		return targetPath, true
+	}
+	if targetPath == mountPath {
+		return "/", true
+	}
+	if strings.HasPrefix(targetPath, mountPath) && len(targetPath) > len(mountPath) && targetPath[len(mountPath)] == '/' {
+		return targetPath[len(mountPath):], true
+	}
+	return "", false
+}
+
 // grepStream handles streaming grep results as NDJSON
-func (h *Handler) grepStream(w http.ResponseWriter, path string, re *regexp.Regexp, isDir bool, recursive bool) {
+func (h *Handler) grepStream(w http.ResponseWriter, path string, re *regexp.Regexp, isDir bool, recursive bool, nodeLimit int) {
 	// Set headers for NDJSON streaming
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Transfer-Encoding", "chunked")
@@ -941,9 +1192,9 @@ func (h *Handler) grepStream(w http.ResponseWriter, path string, re *regexp.Rege
 			flusher.Flush()
 			return
 		}
-		err = h.grepDirectoryStream(path, re, sendMatch)
+		_, err = h.grepDirectoryStream(path, re, nodeLimit, sendMatch)
 	} else {
-		err = h.grepFileStream(path, re, sendMatch)
+		_, err = h.grepFileStream(path, re, nodeLimit, sendMatch)
 	}
 
 	// Send final summary with count
@@ -959,18 +1210,22 @@ func (h *Handler) grepStream(w http.ResponseWriter, path string, re *regexp.Rege
 }
 
 // grepFileStream searches for pattern in a single file and calls callback for each match
-func (h *Handler) grepFileStream(path string, re *regexp.Regexp, callback func(GrepMatch) error) error {
+func (h *Handler) grepFileStream(path string, re *regexp.Regexp, nodeLimit int, callback func(GrepMatch) error) (int, error) {
 	// Read file content
 	data, err := h.fs.Read(path, 0, -1)
 	// io.EOF is normal when reading entire file, only return error for other errors
 	if err != nil && err != io.EOF {
-		return err
+		return 0, err
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	lineNum := 1
+	count := 0
 
 	for scanner.Scan() {
+		if nodeLimit > 0 && count >= nodeLimit {
+			break
+		}
 		line := scanner.Text()
 		if re.MatchString(line) {
 			match := GrepMatch{
@@ -979,42 +1234,52 @@ func (h *Handler) grepFileStream(path string, re *regexp.Regexp, callback func(G
 				Content: line,
 			}
 			if err := callback(match); err != nil {
-				return err
+				return count, err
 			}
+			count++
 		}
 		lineNum++
 	}
 
 	if err := scanner.Err(); err != nil {
-		return err
+		return count, err
 	}
 
-	return nil
+	return count, nil
 }
 
 // grepDirectoryStream recursively searches for pattern in a directory and calls callback for each match
-func (h *Handler) grepDirectoryStream(dirPath string, re *regexp.Regexp, callback func(GrepMatch) error) error {
+func (h *Handler) grepDirectoryStream(dirPath string, re *regexp.Regexp, nodeLimit int, callback func(GrepMatch) error) (int, error) {
 	// List directory contents
 	entries, err := h.fs.ReadDir(dirPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
+	totalCount := 0
+
 	for _, entry := range entries {
+		if nodeLimit > 0 && totalCount >= nodeLimit {
+			break
+		}
 		// Build full path
 		// Use path.Join for VFS paths to ensure forward slashes on all OS
 		fullPath := path.Join(dirPath, entry.Name)
 
 		if entry.IsDir {
 			// Recursively search subdirectories
-			if err := h.grepDirectoryStream(fullPath, re, callback); err != nil {
+			count, err := h.grepDirectoryStream(fullPath, re, nodeLimit-totalCount, callback)
+			totalCount += count
+			if err != nil {
 				// Log error but continue searching other files
 				log.Warnf("failed to search directory %s: %v", fullPath, err)
 				continue
 			}
 		} else {
 			// Search in file
-			if err := h.grepFileStream(fullPath, re, callback); err != nil {
+			count, err := h.grepFileStream(fullPath, re, nodeLimit-totalCount, callback)
+			totalCount += count
+			if err != nil {
 				// Log error but continue searching other files
 				log.Warnf("failed to search file %s: %v", fullPath, err)
 				continue
@@ -1022,11 +1287,11 @@ func (h *Handler) grepDirectoryStream(dirPath string, re *regexp.Regexp, callbac
 		}
 	}
 
-	return nil
+	return totalCount, nil
 }
 
 // grepFile searches for pattern in a single file
-func (h *Handler) grepFile(path string, re *regexp.Regexp) ([]GrepMatch, error) {
+func (h *Handler) grepFile(path string, re *regexp.Regexp, nodeLimit int) ([]GrepMatch, error) {
 	// Read file content
 	data, err := h.fs.Read(path, 0, -1)
 	// io.EOF is normal when reading entire file, only return error for other errors
@@ -1039,6 +1304,9 @@ func (h *Handler) grepFile(path string, re *regexp.Regexp) ([]GrepMatch, error) 
 	lineNum := 1
 
 	for scanner.Scan() {
+		if nodeLimit > 0 && len(matches) >= nodeLimit {
+			break
+		}
 		line := scanner.Text()
 		if re.MatchString(line) {
 			matches = append(matches, GrepMatch{
@@ -1058,7 +1326,7 @@ func (h *Handler) grepFile(path string, re *regexp.Regexp) ([]GrepMatch, error) 
 }
 
 // grepDirectory recursively searches for pattern in a directory
-func (h *Handler) grepDirectory(dirPath string, re *regexp.Regexp) ([]GrepMatch, error) {
+func (h *Handler) grepDirectory(dirPath string, re *regexp.Regexp, nodeLimit int) ([]GrepMatch, error) {
 	var allMatches []GrepMatch
 
 	// List directory contents
@@ -1068,13 +1336,16 @@ func (h *Handler) grepDirectory(dirPath string, re *regexp.Regexp) ([]GrepMatch,
 	}
 
 	for _, entry := range entries {
+		if nodeLimit > 0 && len(allMatches) >= nodeLimit {
+			break
+		}
 		// Build full path
 		// Use path.Join for VFS paths to ensure forward slashes on all OS
 		fullPath := path.Join(dirPath, entry.Name)
 
 		if entry.IsDir {
 			// Recursively search subdirectories
-			subMatches, err := h.grepDirectory(fullPath, re)
+			subMatches, err := h.grepDirectory(fullPath, re, nodeLimit-len(allMatches))
 			if err != nil {
 				// Log error but continue searching other files
 				log.Warnf("failed to search directory %s: %v", fullPath, err)
@@ -1083,7 +1354,7 @@ func (h *Handler) grepDirectory(dirPath string, re *regexp.Regexp) ([]GrepMatch,
 			allMatches = append(allMatches, subMatches...)
 		} else {
 			// Search in file
-			matches, err := h.grepFile(fullPath, re)
+			matches, err := h.grepFile(fullPath, re, nodeLimit-len(allMatches))
 			if err != nil {
 				// Log error but continue searching other files
 				log.Warnf("failed to search file %s: %v", fullPath, err)

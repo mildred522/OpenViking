@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       os_json:
-        description: 'JSON string of OS to build on'
+        description: 'JSON string of runner labels to build on (ubuntu-latest=x86_64, macos-latest=arm64, macos-15-intel=x86_64, windows-latest=x86_64)'
         required: false
         type: string
         default: '["ubuntu-latest", "macos-latest", "macos-15-intel", "windows-latest"]'
@@ -36,7 +36,7 @@ on:
         type: boolean
         default: true
       os_json:
-        description: 'JSON string of OS to build on'
+        description: 'JSON string of runner labels to build on (ubuntu-latest=x86_64, macos-latest=arm64, macos-15-intel=x86_64, windows-latest=x86_64)'
         required: false
         default: '["ubuntu-latest", "macos-latest", "macos-15-intel", "windows-latest"]'
       python_json:
@@ -46,7 +46,7 @@ on:
 
 jobs:
   build-sdist:
-    name: Build source distribution
+    name: Build source distribution py3.12
     if: inputs.build_sdist
     runs-on: ubuntu-latest
     steps:
@@ -79,6 +79,9 @@ jobs:
       run: |
         git reset --hard HEAD
         git clean -fd
+        # For sdist, ensure local runtime binaries are not packaged even if present
+        rm -rf openviking/bin openviking/lib third_party/agfs/bin || true
+        rm -f openviking/storage/vectordb/*.so openviking/storage/vectordb/*.dylib openviking/storage/vectordb/*.dll openviking/storage/vectordb/*.exe || true
         rm -rf openviking/_version.py openviking.egg-info
         # Ignore uv.lock changes to avoid dirty state in setuptools_scm
         git update-index --assume-unchanged uv.lock || true
@@ -99,7 +102,7 @@ jobs:
       run: uv run --frozen python -m build --sdist
 
     - name: Store the distribution packages
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-distributions-sdist
         path: dist/*.tar.gz
@@ -182,12 +185,15 @@ jobs:
         echo "LD_LIBRARY_PATH=${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}"
         "$PYTHON_BIN" -V
-
     - name: Set up Go
       uses: actions/setup-go@v6
       with:
         go-version: '1.25.1'
 
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: stable
     - name: Install uv
       uses: astral-sh/setup-uv@v7
       with:
@@ -205,6 +211,14 @@ jobs:
     - name: Install build dependencies
       run: uv pip install setuptools setuptools_scm pybind11 cmake wheel build
 
+    - name: Build Rust CLI (Linux)
+      run: cargo build --release --target x86_64-unknown-linux-gnu -p ov_cli
+
+    - name: Copy Rust CLI binary (Linux)
+      run: |
+        mkdir -p openviking/bin
+        cp target/x86_64-unknown-linux-gnu/release/ov openviking/bin/
+        chmod +x openviking/bin/ov
     - name: Clean workspace (force ignore dirty)
       shell: bash
       run: |
@@ -253,7 +267,7 @@ jobs:
         rmdir dist_fixed
 
     - name: Store the distribution packages
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-distributions-linux-${{ matrix.python-version }}
         path: dist/
@@ -266,7 +280,7 @@ jobs:
         echo "::notice::Build Wheel Version (Linux py${{ matrix.python-version }}): $VERSION"
 
   build-other:
-    name: Build distribution on ${{ matrix.os }}
+    name: Build distribution on ${{ matrix.os == 'macos-latest' && 'macOS arm64 (macos-latest)' || matrix.os == 'macos-15-intel' && 'macOS x86_64 (macos-15-intel)' || matrix.os == 'windows-latest' && 'Windows x86_64 (windows-latest)' || matrix.os }} py${{ matrix.python-version }}
     # Filter out ubuntu-latest from this job since it's handled by build-linux
     if: inputs.build_wheels
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
@@ -293,11 +307,39 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Configure macOS wheel architecture tag
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "macos-15-intel" ]]; then
+          TARGET_ARCH="x86_64"
+        else
+          TARGET_ARCH="arm64"
+        fi
+
+        MACOS_VERSION="$(python - <<'PY'
+        import platform
+        ver = platform.mac_ver()[0].split(".")
+        major = ver[0] if ver and ver[0] else "15"
+        minor = ver[1] if len(ver) > 1 else "0"
+        print(f"{major}.{minor}")
+        PY
+        )"
+
+        echo "ARCHFLAGS=-arch ${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "CMAKE_OSX_ARCHITECTURES=${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "_PYTHON_HOST_PLATFORM=macosx-${MACOS_VERSION}-${TARGET_ARCH}" >> "$GITHUB_ENV"
+        echo "Configured macOS wheel platform: macosx-${MACOS_VERSION}-${TARGET_ARCH}"
+
     - name: Set up Go
       uses: actions/setup-go@v6
       with:
         go-version: '1.25.1'
 
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: stable
     - name: Install uv
       uses: astral-sh/setup-uv@v7
       with:
@@ -319,6 +361,25 @@ jobs:
     - name: Install build dependencies
       run: uv pip install setuptools setuptools_scm pybind11 cmake wheel build
 
+    - name: Build Rust CLI (macOS/Windows)
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cargo build --release --target x86_64-pc-windows-msvc -p ov_cli
+        else
+          cargo build --release -p ov_cli
+        fi
+
+    - name: Copy Rust CLI binary (macOS/Windows)
+      shell: bash
+      run: |
+        mkdir -p openviking/bin
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cp target/x86_64-pc-windows-msvc/release/ov.exe openviking/bin/
+        else
+          cp target/release/ov openviking/bin/
+          chmod +x openviking/bin/ov
+        fi
     - name: Clean workspace (force ignore dirty)
       shell: bash
       run: |
@@ -344,9 +405,9 @@ jobs:
       run: uv run --frozen python -m build --wheel
 
     - name: Store the distribution packages
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
-        name: python-package-distributions-${{ matrix.os }}-${{ matrix.python-version }}
+        name: python-package-distributions-${{ matrix.os == 'macos-latest' && 'macos-arm64' || matrix.os == 'macos-15-intel' && 'macos-x86_64' || matrix.os == 'windows-latest' && 'windows-x86_64' || matrix.os }}-${{ matrix.python-version }}
         path: dist/
 
     - name: Display built wheel version
@@ -355,4 +416,4 @@ jobs:
       run: |
         VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
         echo "Build Version: $VERSION"
-        echo "::notice::Build Wheel Version (${{ matrix.os }} py${{ matrix.python-version }}): $VERSION"
+        echo "::notice::Build Wheel Version (${{ matrix.os == 'macos-latest' && 'macOS arm64 (macos-latest)' || matrix.os == 'macos-15-intel' && 'macOS x86_64 (macos-15-intel)' || matrix.os == 'windows-latest' && 'Windows x86_64 (windows-latest)' || matrix.os }} py${{ matrix.python-version }}): $VERSION"

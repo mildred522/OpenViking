@@ -31,8 +31,12 @@ class SyncHTTPClient:
         self,
         url: Optional[str] = None,
         api_key: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        timeout: float = 60.0,
     ):
-        self._async_client = AsyncHTTPClient(url=url, api_key=api_key)
+        self._async_client = AsyncHTTPClient(
+            url=url, api_key=api_key, agent_id=agent_id, timeout=timeout
+        )
         self._initialized = False
 
     # ============= Lifecycle =============
@@ -49,9 +53,22 @@ class SyncHTTPClient:
 
     # ============= session =============
 
-    def session(self, session_id: Optional[str] = None) -> Any:
-        """Create new session or load existing session."""
-        return self._async_client.session(session_id)
+    def session(self, session_id: Optional[str] = None, must_exist: bool = False) -> Any:
+        """Create a new session or load an existing one.
+
+        Args:
+            session_id: Session ID, creates a new session if None
+            must_exist: If True and session_id is provided, raises NotFoundError
+                        when the session does not exist.
+
+        Returns:
+            Session object
+        """
+        return self._async_client.session(session_id, must_exist=must_exist)
+
+    def session_exists(self, session_id: str) -> bool:
+        """Check whether a session exists in storage."""
+        return run_async(self._async_client.session_exists(session_id))
 
     def create_session(self) -> Dict[str, Any]:
         """Create a new session."""
@@ -69,9 +86,24 @@ class SyncHTTPClient:
         """Delete a session."""
         run_async(self._async_client.delete_session(session_id))
 
-    def add_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Add a message to a session."""
-        return run_async(self._async_client.add_message(session_id, role, content))
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str | None = None,
+        parts: list[dict] | None = None,
+    ) -> Dict[str, Any]:
+        """Add a message to a session.
+
+        Args:
+            session_id: Session ID
+            role: Message role ("user" or "assistant")
+            content: Text content (simple mode)
+            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+
+        If both content and parts are provided, parts takes precedence.
+        """
+        return run_async(self._async_client.add_message(session_id, role, content, parts))
 
     def commit_session(self, session_id: str) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
@@ -87,10 +119,27 @@ class SyncHTTPClient:
         instruction: str = "",
         wait: bool = False,
         timeout: Optional[float] = None,
+        strict: bool = True,
+        ignore_dirs: Optional[str] = None,
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+        directly_upload_media: bool = True,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking."""
         return run_async(
-            self._async_client.add_resource(path, target, reason, instruction, wait, timeout)
+            self._async_client.add_resource(
+                path,
+                target,
+                reason,
+                instruction,
+                wait,
+                timeout,
+                strict,
+                ignore_dirs,
+                include,
+                exclude,
+                directly_upload_media,
+            )
         )
 
     def add_skill(
@@ -115,6 +164,7 @@ class SyncHTTPClient:
         session: Optional[Any] = None,
         session_id: Optional[str] = None,
         limit: int = 10,
+        node_limit: Optional[int] = None,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
     ):
@@ -126,6 +176,7 @@ class SyncHTTPClient:
                 session=session,
                 session_id=session_id,
                 limit=limit,
+                node_limit=node_limit,
                 score_threshold=score_threshold,
                 filter=filter,
             )
@@ -136,15 +187,24 @@ class SyncHTTPClient:
         query: str,
         target_uri: str = "",
         limit: int = 10,
+        node_limit: Optional[int] = None,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
     ):
         """Semantic search without session context."""
-        return run_async(self._async_client.find(query, target_uri, limit, score_threshold, filter))
+        return run_async(
+            self._async_client.find(query, target_uri, limit, node_limit, score_threshold, filter)
+        )
 
-    def grep(self, uri: str, pattern: str, case_insensitive: bool = False) -> Dict:
+    def grep(
+        self,
+        uri: str,
+        pattern: str,
+        case_insensitive: bool = False,
+        node_limit: Optional[int] = None,
+    ) -> Dict:
         """Content search with pattern."""
-        return run_async(self._async_client.grep(uri, pattern, case_insensitive))
+        return run_async(self._async_client.grep(uri, pattern, case_insensitive, node_limit))
 
     def glob(self, pattern: str, uri: str = "viking://") -> Dict:
         """File pattern matching."""
@@ -212,9 +272,9 @@ class SyncHTTPClient:
 
     # ============= Content =============
 
-    def read(self, uri: str) -> str:
+    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         """Read file content."""
-        return run_async(self._async_client.read(uri))
+        return run_async(self._async_client.read(uri, offset=offset, limit=limit))
 
     def abstract(self, uri: str) -> str:
         """Read L0 abstract."""
@@ -249,6 +309,42 @@ class SyncHTTPClient:
     ) -> str:
         """Import .ovpack file."""
         return run_async(self._async_client.import_ovpack(file_path, target, force, vectorize))
+
+    # ============= Admin =============
+
+    def admin_create_account(self, account_id: str, admin_user_id: str) -> Dict[str, Any]:
+        """Create a new account with its first admin user."""
+        return run_async(self._async_client.admin_create_account(account_id, admin_user_id))
+
+    def admin_list_accounts(self) -> List[Any]:
+        """List all accounts."""
+        return run_async(self._async_client.admin_list_accounts())
+
+    def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
+        """Delete an account and all associated users."""
+        return run_async(self._async_client.admin_delete_account(account_id))
+
+    def admin_register_user(
+        self, account_id: str, user_id: str, role: str = "user"
+    ) -> Dict[str, Any]:
+        """Register a new user in an account."""
+        return run_async(self._async_client.admin_register_user(account_id, user_id, role))
+
+    def admin_list_users(self, account_id: str) -> List[Any]:
+        """List all users in an account."""
+        return run_async(self._async_client.admin_list_users(account_id))
+
+    def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        """Remove a user from an account."""
+        return run_async(self._async_client.admin_remove_user(account_id, user_id))
+
+    def admin_set_role(self, account_id: str, user_id: str, role: str) -> Dict[str, Any]:
+        """Change a user's role."""
+        return run_async(self._async_client.admin_set_role(account_id, user_id, role))
+
+    def admin_regenerate_key(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        """Regenerate a user's API key. Old key is immediately invalidated."""
+        return run_async(self._async_client.admin_regenerate_key(account_id, user_id))
 
     # ============= Debug =============
 

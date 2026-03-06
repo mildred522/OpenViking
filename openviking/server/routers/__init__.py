@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """OpenViking HTTP Server routers."""
 
+from openviking.server.routers.admin import router as admin_router
+from openviking.server.routers.bot import router as bot_router
 from openviking.server.routers.content import router as content_router
 from openviking.server.routers.debug import router as debug_router
 from openviking.server.routers.filesystem import router as filesystem_router
@@ -14,6 +16,8 @@ from openviking.server.routers.sessions import router as sessions_router
 from openviking.server.routers.system import router as system_router
 
 __all__ = [
+    "admin_router",
+    "bot_router",
     "system_router",
     "resources_router",
     "filesystem_router",
