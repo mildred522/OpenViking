@@ -84,7 +84,7 @@ class HierarchicalRetriever:
         query: TypedQuery,
         ctx: RequestContext,
         limit: int = 5,
-        mode: RetrieverMode = RetrieverMode.THINKING,
+        mode: str = RetrieverMode.THINKING,
         score_threshold: Optional[float] = None,
         score_gte: bool = False,
         scope_dsl: Optional[Dict[str, Any]] = None,
@@ -209,7 +209,9 @@ class HierarchicalRetriever:
         try:
             scores = self._rerank_client.rerank_batch(query, documents)
         except Exception as e:
-            logger.warning("[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e)
+            logger.warning(
+                "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e
+            )
             return fallback_scores
 
         if not scores or len(scores) != len(documents):
