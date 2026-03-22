@@ -42,7 +42,9 @@ def test_openviking_config_accepts_custom_file_chunk_settings():
 
 
 def test_openviking_config_rejects_invalid_file_chunk_overlap():
-    with pytest.raises(ValueError, match="file_chunk_overlap must be smaller than file_chunk_chars"):
+    with pytest.raises(
+        ValueError, match="file_chunk_overlap must be smaller than file_chunk_chars"
+    ):
         OpenVikingConfig.from_dict(
             {
                 **_minimal_config_dict(),

@@ -311,7 +311,9 @@ async def vectorize_file(
                     content = await viking_fs.read_file(file_path, ctx=ctx)
                     if isinstance(content, bytes):
                         content = content.decode("utf-8", errors="replace")
-                    chunks = _chunk_text(content, config.file_chunk_chars, config.file_chunk_overlap)
+                    chunks = _chunk_text(
+                        content, config.file_chunk_chars, config.file_chunk_overlap
+                    )
                     if len(chunks) <= 1:
                         context.set_vectorize(Vectorize(text=content))
                     else:
