@@ -103,7 +103,8 @@ class OpenVikingConfig(BaseModel):
     )
 
     feishu: FeishuConfig = Field(
-        default_factory=lambda: FeishuConfig(), description="Feishu/Lark document parsing configuration"
+        default_factory=lambda: FeishuConfig(),
+        description="Feishu/Lark document parsing configuration",
     )
 
     semantic: SemanticConfig = Field(
