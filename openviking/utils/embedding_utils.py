@@ -8,7 +8,7 @@ Common logic for creating Context objects and enqueuing them to EmbeddingQueue.
 
 import os
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from openviking.core.context import Context, ContextLevel, ResourceContentType, Vectorize
 from openviking.server.identity import RequestContext
@@ -16,8 +16,44 @@ from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
+
+
+def _chunk_text(text: str, chunk_chars: int, chunk_overlap: int) -> List[str]:
+    """Split text into overlapping chunks for long-file vectorization."""
+    if not text:
+        return []
+    if len(text) <= chunk_chars:
+        return [text]
+
+    step = max(chunk_chars - chunk_overlap, 1)
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = min(start + chunk_chars, len(text))
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start += step
+
+    return chunks
+
+
+async def _enqueue_context(
+    context: Context,
+    embedding_queue: Any,
+    semantic_msg_id: Optional[str] = None,
+) -> bool:
+    """Convert a Context into an embedding message and enqueue it."""
+    embedding_msg = EmbeddingMsgConverter.from_context(context)
+    if not embedding_msg:
+        return False
+    embedding_msg.semantic_msg_id = semantic_msg_id
+    await embedding_queue.enqueue(embedding_msg)
+    return True
 
 
 async def _decrement_embedding_tracker(semantic_msg_id: Optional[str], count: int) -> None:
@@ -146,9 +182,10 @@ async def vectorize_directory_meta(
             return
 
         queue_manager = get_queue_manager()
-        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
+        embedding_queue = cast(Any, queue_manager.get_queue(queue_manager.EMBEDDING))
 
-        parent_uri = VikingURI(uri).parent.uri
+        parent = VikingURI(uri).parent
+        parent_uri = parent.uri if parent else ""
         owner_space = _owner_space_for_uri(uri, ctx)
 
         # Vectorize L0: .abstract.md (abstract)
@@ -230,11 +267,14 @@ async def vectorize_file(
             return
 
         queue_manager = get_queue_manager()
-        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
-        viking_fs = get_viking_fs()
+        embedding_queue = cast(Any, queue_manager.get_queue(queue_manager.EMBEDDING))
+        viking_fs = cast(Any, get_viking_fs())
+        config = get_openviking_config()
 
         file_name = summary_dict.get("name") or os.path.basename(file_path)
         summary = summary_dict.get("summary", "")
+        owner_space = _owner_space_for_uri(file_path, ctx)
+        created_at = datetime.now()
 
         context = Context(
             uri=file_path,
@@ -242,10 +282,10 @@ async def vectorize_file(
             is_leaf=True,
             abstract=summary,
             context_type=context_type,
-            created_at=datetime.now(),
+            created_at=created_at,
             user=ctx.user,
             account_id=ctx.account_id,
-            owner_space=_owner_space_for_uri(file_path, ctx),
+            owner_space=owner_space,
         )
 
         content_type = get_resource_content_type(file_name)
@@ -271,7 +311,56 @@ async def vectorize_file(
                     content = await viking_fs.read_file(file_path, ctx=ctx)
                     if isinstance(content, bytes):
                         content = content.decode("utf-8", errors="replace")
-                    context.set_vectorize(Vectorize(text=content))
+                    chunks = _chunk_text(content, config.file_chunk_chars, config.file_chunk_overlap)
+                    if len(chunks) <= 1:
+                        context.set_vectorize(Vectorize(text=content))
+                    else:
+                        if summary:
+                            context.set_vectorize(Vectorize(text=summary))
+                            if not await _enqueue_context(
+                                context,
+                                embedding_queue,
+                                semantic_msg_id=semantic_msg_id,
+                            ):
+                                return
+                            enqueued = True
+                            logger.debug(
+                                "Enqueued canonical summary vector for chunked file: %s", file_path
+                            )
+
+                        for index, chunk_text in enumerate(chunks):
+                            chunk_context = Context(
+                                uri=f"{file_path}#chunk_{index:04d}",
+                                parent_uri=parent_uri,
+                                is_leaf=True,
+                                abstract=summary,
+                                context_type=context_type,
+                                created_at=created_at,
+                                user=ctx.user,
+                                account_id=ctx.account_id,
+                                owner_space=owner_space,
+                                meta={
+                                    "chunk_index": index,
+                                    "chunk_count": len(chunks),
+                                    "source_uri": file_path,
+                                },
+                                level=ContextLevel.DETAIL,
+                            )
+                            chunk_context.set_vectorize(Vectorize(text=chunk_text))
+                            if not await _enqueue_context(
+                                chunk_context,
+                                embedding_queue,
+                                semantic_msg_id=semantic_msg_id,
+                            ):
+                                continue
+                            enqueued = True
+
+                        logger.debug(
+                            "Enqueued %d chunk vectors for long text file: %s",
+                            len(chunks),
+                            file_path,
+                        )
+                        return
                 except Exception as e:
                     logger.warning(
                         f"Failed to read file content for {file_path}, falling back to summary: {e}"
@@ -290,12 +379,8 @@ async def vectorize_file(
             logger.debug(f"Skipping file {file_path} (no text content or summary)")
             return
 
-        embedding_msg = EmbeddingMsgConverter.from_context(context)
-        if not embedding_msg:
+        if not await _enqueue_context(context, embedding_queue, semantic_msg_id=semantic_msg_id):
             return
-
-        embedding_msg.semantic_msg_id = semantic_msg_id
-        await embedding_queue.enqueue(embedding_msg)
         enqueued = True
         logger.debug(f"Enqueued file for vectorization: {file_path}")
 
@@ -316,7 +401,7 @@ async def index_resource(
     1. Reads .abstract.md and .overview.md and vectorizes them.
     2. Scans files in the directory and vectorizes them.
     """
-    viking_fs = get_viking_fs()
+    viking_fs = cast(Any, get_viking_fs())
 
     # 1. Index Directory Metadata
     abstract_uri = f"{uri}/.abstract.md"

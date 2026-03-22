@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -127,6 +127,16 @@ class OpenVikingConfig(BaseModel):
         default=3600, description="Interval (seconds) to check for expired memories"
     )
 
+    file_chunk_chars: int = Field(
+        default=4000,
+        description="Maximum characters per chunk when vectorizing long text files",
+    )
+
+    file_chunk_overlap: int = Field(
+        default=400,
+        description="Overlapping characters between adjacent file chunks",
+    )
+
     language_fallback: str = Field(
         default="en",
         description=(
@@ -138,6 +148,17 @@ class OpenVikingConfig(BaseModel):
     log: LogConfig = Field(default_factory=lambda: LogConfig(), description="Logging configuration")
 
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_chunk_settings(self) -> "OpenVikingConfig":
+        """Validate file chunking settings used during file vectorization."""
+        if self.file_chunk_chars <= 0:
+            raise ValueError("file_chunk_chars must be positive")
+        if self.file_chunk_overlap < 0:
+            raise ValueError("file_chunk_overlap must be non-negative")
+        if self.file_chunk_overlap >= self.file_chunk_chars:
+            raise ValueError("file_chunk_overlap must be smaller than file_chunk_chars")
+        return self
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "OpenVikingConfig":

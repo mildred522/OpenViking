@@ -500,6 +500,24 @@ Reranking model for search result refinement.
 
 If rerank is not configured, search uses vector similarity only.
 
+### retrieval indexing
+
+Long text files are chunked during file-level vectorization so a single oversized file does not
+collapse into one coarse L2 embedding only. Chunk hits are collapsed back to the base file URI at
+retrieval time.
+
+```json
+{
+  "file_chunk_chars": 4000,
+  "file_chunk_overlap": 400
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `file_chunk_chars` | int | Maximum characters per chunk when vectorizing long text files | `4000` |
+| `file_chunk_overlap` | int | Overlapping characters between adjacent file chunks | `400` |
+
 ### storage
 
 Storage configuration for context data, including file storage (AGFS) and vector database storage (VectorDB).
@@ -837,6 +855,8 @@ For details on the lock mechanism, see [Path Locks and Crash Recovery](../concep
   "code": {
     "code_summary_mode": "ast"
   },
+  "file_chunk_chars": 4000,
+  "file_chunk_overlap": 400,
   "server": {
     "host": "0.0.0.0",
     "port": 1933,

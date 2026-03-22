@@ -8,8 +8,9 @@ and rerank-based relevance scoring.
 """
 
 import heapq
-import math
 import logging
+import math
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,6 +52,7 @@ class HierarchicalRetriever:
     GLOBAL_SEARCH_TOPK = 5  # Global retrieval count
     HOTNESS_ALPHA = 0.2  # Weight for hotness score in final ranking (0 = disabled)
     LEVEL_URI_SUFFIX = {0: ".abstract.md", 1: ".overview.md"}
+    CHUNK_URI_PATTERN = re.compile(r"#chunk_\d+$")
 
     def __init__(
         self,
@@ -177,6 +179,7 @@ class HierarchicalRetriever:
         # 从 global_results 中提取 level 2 的文件作为初始候选者
         initial_candidates = [r for r in global_results if r.get("level", 2) == 2]
 
+        initial_candidates = [r for r in global_results if r.get("level", 2) == 2]
         initial_candidates = self._prepare_initial_candidates(
             query.query,
             initial_candidates,
@@ -184,13 +187,14 @@ class HierarchicalRetriever:
         )
 
         # Step 4: Recursive search
+        recursive_limit = max(limit * 3, 10)
         candidates = await self._recursive_search(
             vector_proxy=vector_proxy,
             query=query.query,
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
             starting_points=starting_points,
-            limit=limit,
+            limit=recursive_limit,
             mode=mode,
             threshold=effective_threshold,
             score_gte=score_gte,
@@ -501,6 +505,7 @@ class HierarchicalRetriever:
         is controlled by ``HOTNESS_ALPHA`` (0 disables the boost).
         """
         results = []
+        candidates = self._collapse_chunk_candidates(candidates)
 
         for c in candidates:
             # Read related contexts and get summaries
@@ -562,6 +567,61 @@ class HierarchicalRetriever:
         # Re-sort by blended score so hotness boost can change ranking
         results.sort(key=lambda x: x.score, reverse=True)
         return results
+
+    @classmethod
+    def _base_uri_for_chunk(cls, uri: str) -> str:
+        """Strip chunk suffix from vector-only file chunk URIs."""
+        if not uri:
+            return uri
+        return cls.CHUNK_URI_PATTERN.sub("", uri)
+
+    @classmethod
+    def _collapse_chunk_candidates(cls, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collapse chunk-level file hits back to a single file-level candidate."""
+        collapsed: Dict[str, Dict[str, Any]] = {}
+
+        for candidate in candidates:
+            candidate_copy = dict(candidate)
+            original_uri = candidate_copy.get("uri", "")
+            base_uri = cls._base_uri_for_chunk(original_uri)
+            is_chunk = base_uri != original_uri
+            candidate_copy["uri"] = base_uri
+
+            previous = collapsed.get(base_uri)
+            candidate_score = candidate_copy.get("_final_score", candidate_copy.get("_score", 0.0))
+
+            if previous is None:
+                collapsed[base_uri] = candidate_copy
+            else:
+                previous_score = previous.get("_final_score", previous.get("_score", 0.0))
+                if candidate_score > previous_score:
+                    preserved_abstract = previous.get("abstract", "")
+                    preserved_context_type = previous.get("context_type")
+                    preserved_category = previous.get("category")
+                    collapsed[base_uri] = candidate_copy
+                    if preserved_abstract and is_chunk and not candidate_copy.get("abstract"):
+                        collapsed[base_uri]["abstract"] = preserved_abstract
+                    if preserved_context_type and not candidate_copy.get("context_type"):
+                        collapsed[base_uri]["context_type"] = preserved_context_type
+                    if preserved_category and not candidate_copy.get("category"):
+                        collapsed[base_uri]["category"] = preserved_category
+                else:
+                    if not previous.get("abstract") and candidate_copy.get("abstract"):
+                        previous["abstract"] = candidate_copy["abstract"]
+                    if not previous.get("context_type") and candidate_copy.get("context_type"):
+                        previous["context_type"] = candidate_copy["context_type"]
+                    if not previous.get("category") and candidate_copy.get("category"):
+                        previous["category"] = candidate_copy["category"]
+
+            collapsed_candidate = collapsed[base_uri]
+            if not is_chunk and candidate_copy.get("abstract"):
+                collapsed_candidate["abstract"] = candidate_copy["abstract"]
+
+        return sorted(
+            collapsed.values(),
+            key=lambda item: item.get("_final_score", item.get("_score", 0.0)),
+            reverse=True,
+        )
 
     @classmethod
     def _append_level_suffix(cls, uri: str, level: int) -> str:
